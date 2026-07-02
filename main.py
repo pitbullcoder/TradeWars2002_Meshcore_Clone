@@ -24,6 +24,8 @@ import random
 import re
 import time
 
+from datetime import datetime
+
 from meshcore import MeshCore, EventType
 
 from db import (
@@ -65,6 +67,7 @@ from db import (
     set_station_defenses,
     delete_station,
     get_ships_docked_at_station,
+    get_last_tx_time,
     get_ship,
     get_parked_ships_in_sector,
     set_parked_ship_defenses,
@@ -147,10 +150,63 @@ __all__ = [
     "PENDING_WARPS", "PENDING_TRADES", "PENDING_UPGRADES", "PENDING_ATTACKS",
     "PENDING_STATIONS", "PENDING_P2P", "PENDING_TOWS", "PENDING_BOARDS",
     "on_message", "on_channel_message", "main",
+    "maybe_advertise", "advertise_loop",
 ]
 
 
 PUBLIC_CHANNEL_IDX = 0  # which channel index the bot listens to for public commands
+
+
+# --- Channel advertisement ----------------------------------------------
+# Every ADVERT_INTERVAL_SECONDS the bot broadcasts an invitation on the
+# public channel. The schedule keys off the messages log (the last time
+# ADVERT_TEXT was actually transmitted), so restarting the bot resumes
+# the countdown rather than re-advertising early; a fresh install with no
+# prior broadcast advertises immediately. Kept under one radio chunk (130
+# chars) so the logged text matches ADVERT_TEXT exactly.
+ADVERT_TEXT = "TradeWars 2002 is ready to play, just submit a DM to play!"
+
+
+ADVERT_INTERVAL_SECONDS = 48 * 60 * 60  # once every 48 hours
+
+
+# How often advertise_loop wakes to check whether an ad is due. Short
+# check naps (instead of one 48-hour sleep) keep the schedule accurate
+# across system clock hiccups and retry failed sends within minutes.
+ADVERT_CHECK_INTERVAL_SECONDS = 10 * 60
+
+
+def _seconds_until_next_advert():
+    """How long until the next channel ad is due: 0 if it's never been
+    broadcast (or the last one was ADVERT_INTERVAL_SECONDS+ ago), else
+    the remainder of the 48-hour countdown from the last transmission."""
+    last = get_last_tx_time(f"chan{PUBLIC_CHANNEL_IDX}", ADVERT_TEXT)
+    if last is None:
+        return 0
+    elapsed = time.time() - datetime.fromisoformat(last).timestamp()
+    return max(0.0, ADVERT_INTERVAL_SECONDS - elapsed)
+
+
+async def maybe_advertise(mc):
+    """Broadcast the invitation if one is due. Returns True if it was
+    sent (send_channel_reply logs the transmission, which is what arms
+    the next 48-hour countdown). Split out from advertise_loop so the
+    decision + send is testable without an infinite loop."""
+    if _seconds_until_next_advert() > 0:
+        return False
+    print("→ broadcasting channel advertisement")
+    await send_channel_reply(mc, PUBLIC_CHANNEL_IDX, ADVERT_TEXT)
+    return True
+
+
+async def advertise_loop(mc):
+    """Background task: wake every ADVERT_CHECK_INTERVAL_SECONDS and
+    broadcast the ad whenever 48 hours have passed since the last one.
+    A failed send isn't logged as transmitted, so it's simply retried on
+    the next wake-up."""
+    while True:
+        await maybe_advertise(mc)
+        await asyncio.sleep(ADVERT_CHECK_INTERVAL_SECONDS)
 
 
 MIN_SECTOR_ID = 1
@@ -2041,6 +2097,7 @@ async def main():
     )
 
     asyncio.create_task(monitor_inactivity(mc))
+    asyncio.create_task(advertise_loop(mc))
 
     print("Bot is running...")
     while True:

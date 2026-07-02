@@ -91,6 +91,9 @@ STATE = {
     # suite's setUp.
     "parked_ships": {},
     "parked_defense_log": [],
+    # (pubkey_prefix, text) -> ISO timestamp of the last logged tx; feeds
+    # _stub_get_last_tx_time for the channel-advertisement scheduler.
+    "last_tx_times": {},
     "ship_move_log": [],
     "ship_delete_log": [],
     "park_buy_log": [],
@@ -344,6 +347,10 @@ def _stub_get_ships_docked_at_station(station_id):
          if s.get("docked_station_id") == station_id),
         key=lambda s: s["id"],
     )
+
+
+def _stub_get_last_tx_time(pubkey_prefix, text):
+    return STATE["last_tx_times"].get((pubkey_prefix, text))
 
 
 def _stub_transfer_station_credits(player_id, station_id, amount):
@@ -822,6 +829,7 @@ def _install_stub_modules():
     db_stub.station_dock_capacity = station_dock_capacity
     db_stub.DOCKED_SHIPS_PER_LEVEL = DOCKED_SHIPS_PER_LEVEL
     db_stub.transfer_station_credits = _stub_transfer_station_credits
+    db_stub.get_last_tx_time = _stub_get_last_tx_time
     db_stub.sell_value = _stub_sell_value
     db_stub.SHIP_CATALOG = SHIP_CATALOG
     db_stub.DEFAULT_SHIP_TYPE = DEFAULT_SHIP_TYPE
@@ -4631,6 +4639,82 @@ class StationTreasuryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Its treasury of 90000cr is lost to the void.", report)
         self.assertEqual(STATE["player"]["credits"], 0)   # no looting
         self.assertNotIn(1, STATE["stations"])
+
+
+class AdvertiseTests(unittest.IsolatedAsyncioTestCase):
+    """The 48-hour public-channel advertisement: due immediately on a
+    fresh install, silent while the countdown runs, due again after 48
+    hours -- all keyed off the messages log so restarts never re-spam."""
+
+    def setUp(self):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        _reset_multiship_state()
+        STATE["last_tx_times"] = {}
+
+    class _FakeCommands:
+        def __init__(self):
+            self.sent = []
+
+        async def send_chan_msg(self, channel_idx, text):
+            self.sent.append((channel_idx, text))
+
+            class _Result:
+                type = "OK"
+            return _Result()
+
+    class _FakeMC:
+        def __init__(self):
+            self.commands = AdvertiseTests._FakeCommands()
+
+    def _last_ad(self, seconds_ago):
+        from datetime import datetime, timedelta, timezone
+        when = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        STATE["last_tx_times"][
+            (f"chan{main.PUBLIC_CHANNEL_IDX}", main.ADVERT_TEXT)
+        ] = when.isoformat()
+
+    def test_the_interval_is_48_hours(self):
+        self.assertEqual(main.ADVERT_INTERVAL_SECONDS, 48 * 60 * 60)
+
+    def test_the_ad_fits_in_one_radio_chunk(self):
+        self.assertLessEqual(len(main.ADVERT_TEXT), 130)
+        self.assertIn("TradeWars 2002 is ready to play", main.ADVERT_TEXT)
+        self.assertIn("DM", main.ADVERT_TEXT)
+
+    def test_due_immediately_when_never_advertised(self):
+        self.assertEqual(main._seconds_until_next_advert(), 0)
+
+    def test_not_due_during_the_countdown(self):
+        self._last_ad(seconds_ago=60 * 60)          # an hour ago
+        remaining = main._seconds_until_next_advert()
+        self.assertGreater(remaining, 46 * 60 * 60)
+        self.assertLess(remaining, 48 * 60 * 60)
+
+    def test_due_again_after_48_hours(self):
+        self._last_ad(seconds_ago=49 * 60 * 60)
+        self.assertEqual(main._seconds_until_next_advert(), 0)
+
+    async def test_maybe_advertise_broadcasts_on_the_public_channel(self):
+        import contextlib
+        import io
+        mc = self._FakeMC()
+        with contextlib.redirect_stdout(io.StringIO()):
+            sent = await main.maybe_advertise(mc)
+        self.assertTrue(sent)
+        self.assertEqual(
+            mc.commands.sent,
+            [(main.PUBLIC_CHANNEL_IDX, main.ADVERT_TEXT)],  # one chunk, no prefix
+        )
+
+    async def test_maybe_advertise_stays_quiet_mid_countdown(self):
+        self._last_ad(seconds_ago=60 * 60)
+        mc = self._FakeMC()
+        sent = await main.maybe_advertise(mc)
+        self.assertFalse(sent)
+        self.assertEqual(mc.commands.sent, [])
 
 
 if __name__ == "__main__":

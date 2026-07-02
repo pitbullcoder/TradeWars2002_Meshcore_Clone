@@ -636,6 +636,30 @@ class StationTreasuryDbTests(unittest.TestCase):
         )
 
 
+class LastTxTimeTests(unittest.TestCase):
+    """get_last_tx_time against the real messages log -- the channel
+    advertisement's restart-safe scheduler depends on it."""
+
+    def setUp(self):
+        db.DB_PATH = os.path.join(tempfile.mkdtemp(), "txlog.db")
+        db.init_db()
+
+    def test_none_when_the_text_was_never_transmitted(self):
+        self.assertIsNone(db.get_last_tx_time("chan0", "hello galaxy"))
+
+    def test_returns_the_latest_matching_tx_only(self):
+        db.log_message("tx", "chan0", "channel", "hello galaxy")
+        db.log_message("rx", "chan0", "channel", "hello galaxy")   # rx ignored
+        db.log_message("tx", "chan0", "channel", "something else") # text ignored
+        db.log_message("tx", "chan1", "channel", "hello galaxy")   # channel ignored
+        first = db.get_last_tx_time("chan0", "hello galaxy")
+        self.assertIsNotNone(first)
+
+        db.log_message("tx", "chan0", "channel", "hello galaxy")
+        second = db.get_last_tx_time("chan0", "hello galaxy")
+        self.assertGreater(second, first)
+
+
 class PortRestockTests(unittest.TestCase):
     """apply_port_restock against a real db: proportional drift of stock
     toward each commodity's starting level (selling up to capacity, buying

@@ -1675,6 +1675,22 @@ def spend_turn(player_id):
     conn.close()
 
 
+def get_last_tx_time(pubkey_prefix, text):
+    """The most recent timestamp (ISO string) at which exactly `text` was
+    transmitted to `pubkey_prefix`, or None if it never was. Used to
+    schedule the periodic channel advertisement off the messages log
+    itself, so a bot restart resumes the countdown instead of
+    re-broadcasting early."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT MAX(timestamp) FROM messages
+           WHERE direction = 'tx' AND pubkey_prefix = ? AND text = ?""",
+        (pubkey_prefix, text)
+    ).fetchone()
+    conn.close()
+    return row[0]
+
+
 def log_message(direction, pubkey_prefix, sender_name, text):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(

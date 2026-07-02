@@ -320,6 +320,14 @@ played** — both player-vs-player combat kills and kills by mines. Brand-new
 players only see kills from when they first joined onward. (The most recent
 entries are shown, with a count of any older ones, to keep it radio-sized.)
 
+### Channel advertisement
+
+Once every **48 hours** the bot broadcasts an invitation on the public
+channel — *"TradeWars 2002 is ready to play, just submit a DM to play!"* —
+so nearby MeshCore users know the game is up. The schedule is kept in the
+message log itself, so restarting the bot **doesn't** trigger an extra
+broadcast; a brand-new install advertises once right after starting.
+
 ### While-you-were-away notices
 
 Separately from the public log, if you personally were attacked or destroyed
