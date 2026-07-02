@@ -595,6 +595,47 @@ class StationDockingDbTests(unittest.TestCase):
         )
 
 
+class StationTreasuryDbTests(unittest.TestCase):
+    """transfer_station_credits against a real db: both directions in one
+    function, and the treasury burning with the station row."""
+
+    def setUp(self):
+        db.DB_PATH = os.path.join(tempfile.mkdtemp(), "treasury.db")
+        db.init_db()
+        conn = db.get_connection()
+        conn.executemany(
+            "INSERT INTO sectors (id) VALUES (?)", [(i,) for i in range(1, 25)]
+        )
+        conn.commit()
+        conn.close()
+        self.player = db.create_player("pk", "Alice")
+        self.station = db.create_station(self.player["id"], "Alice", 20)
+
+    def test_new_stations_start_with_an_empty_treasury(self):
+        self.assertEqual(db.get_station(self.station["id"])["credits"], 0)
+
+    def test_deposit_and_withdraw_round_trip(self):
+        start = db.get_player_with_ship("pk")["credits"]
+
+        db.transfer_station_credits(self.player["id"], self.station["id"], 600)
+        self.assertEqual(db.get_player_with_ship("pk")["credits"], start - 600)
+        self.assertEqual(db.get_station(self.station["id"])["credits"], 600)
+
+        db.transfer_station_credits(self.player["id"], self.station["id"], -250)
+        self.assertEqual(db.get_player_with_ship("pk")["credits"], start - 350)
+        self.assertEqual(db.get_station(self.station["id"])["credits"], 350)
+
+    def test_treasury_dies_with_the_station(self):
+        db.transfer_station_credits(self.player["id"], self.station["id"], 999)
+        db.delete_station(self.station["id"])
+        self.assertIsNone(db.get_station(self.station["id"]))
+        # The credits are simply gone -- the player never gets them back.
+        self.assertEqual(
+            db.get_player_with_ship("pk")["credits"],
+            db.STARTING_CREDITS - 999,
+        )
+
+
 class PortRestockTests(unittest.TestCase):
     """apply_port_restock against a real db: proportional drift of stock
     toward each commodity's starting level (selling up to capacity, buying

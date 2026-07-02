@@ -346,6 +346,15 @@ def _stub_get_ships_docked_at_station(station_id):
     )
 
 
+def _stub_transfer_station_credits(player_id, station_id, amount):
+    pl = _player_by_id(player_id)
+    if pl is not None:
+        pl["credits"] -= amount
+    st = STATE["stations"].get(station_id)
+    if st is not None:
+        st["credits"] = st.get("credits", 0) + amount
+
+
 def _stub_dock_ship_at_station(ship_id, station_id):
     s = STATE["parked_ships"].get(ship_id)
     if s is not None:
@@ -707,6 +716,7 @@ def _stub_create_station(owner_id, owner_name, sector_id):
         "posture": "defensive", "engage_pct": 100,
         "last_fuel_burn": "2026-06-27T12:00:00+00:00",
         "upgrade_to": None, "upgrade_started_at": None,
+        "credits": 0,
     }
     return dict(STATE["stations"][sid])
 
@@ -811,6 +821,7 @@ def _install_stub_modules():
     db_stub.undock_ship = _stub_undock_ship
     db_stub.station_dock_capacity = station_dock_capacity
     db_stub.DOCKED_SHIPS_PER_LEVEL = DOCKED_SHIPS_PER_LEVEL
+    db_stub.transfer_station_credits = _stub_transfer_station_credits
     db_stub.sell_value = _stub_sell_value
     db_stub.SHIP_CATALOG = SHIP_CATALOG
     db_stub.DEFAULT_SHIP_TYPE = DEFAULT_SHIP_TYPE
@@ -2387,6 +2398,7 @@ class P2PCommandTests(unittest.IsolatedAsyncioTestCase):
             "posture": "defensive", "engage_pct": 100,
             "last_fuel_burn": "2026-06-27T12:00:00+00:00",
             "upgrade_to": None, "upgrade_started_at": None,
+            "credits": 0,
         }}
         await self.p2p("101")
         msg = await self.step("organics")
@@ -3476,6 +3488,7 @@ class StationCommandTests(unittest.IsolatedAsyncioTestCase):
             "posture": "defensive", "engage_pct": 100,
             "last_fuel_burn": "2026-06-27T12:00:00+00:00",
             "upgrade_to": None, "upgrade_started_at": None,
+            "credits": 0,
         }
         st.update(over)
         STATE["stations"][sid] = st
@@ -4283,6 +4296,7 @@ class StationDockingTests(unittest.IsolatedAsyncioTestCase):
             "posture": "defensive", "engage_pct": 100,
             "last_fuel_burn": "2026-06-27T12:00:00+00:00",
             "upgrade_to": None, "upgrade_started_at": None,
+            "credits": 0,
         }
         st.update(over)
         STATE["stations"][sid] = st
@@ -4466,6 +4480,157 @@ class StationDockingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("You destroyed Space Station - Tester!", report)
         self.assertNotIn("went down with it", report)
         self.assertIn(13, STATE["parked_ships"])     # still out there, still loot
+
+
+class StationTreasuryTests(unittest.IsolatedAsyncioTestCase):
+    """The station treasury: depositing and withdrawing credits through
+    the station menu, validation, the status line, and the treasury
+    burning with the station."""
+
+    def setUp(self):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        _reset_multiship_state()
+        STATE["stations"] = {}
+        STATE["next_station_id"] = 1
+        STATE["players_by_id"] = {}
+        STATE["attack_events"] = []
+        STATE["kills"] = []
+        STATE["defense_log"] = []
+        STATE["warps"] = {19: [20], 20: [19], 21: [20]}
+        STATE["ports"] = {}
+        STATE["port"] = {}
+        STATE["sector_mines"] = {}
+        STATE["sector_players"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    def _station(self, owner_id=1, owner_name="Tester", sector=20, **over):
+        sid = STATE["next_station_id"]
+        STATE["next_station_id"] += 1
+        st = {
+            "id": sid, "sector_id": sector, "owner_id": owner_id,
+            "owner_name": owner_name, "level": 1, "shields": 0, "fighters": 0,
+            "shields_enabled": 0, "fuel": 0, "organics": 0, "equipment": 0,
+            "posture": "defensive", "engage_pct": 100,
+            "last_fuel_burn": "2026-06-27T12:00:00+00:00",
+            "upgrade_to": None, "upgrade_started_at": None,
+            "credits": 0,
+        }
+        st.update(over)
+        STATE["stations"][sid] = st
+        return st
+
+    async def dock(self):
+        return await main.cmd_station(self.ctx(), "")
+
+    async def say(self, text):
+        return await main.cmd_station_step(self.ctx(), text)
+
+    async def test_status_and_menu_show_the_treasury(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        self._station(credits=12345)
+        menu = await self.dock()
+        self.assertIn("Treasury: 12345cr", menu)
+        self.assertIn("8) Treasury -- deposit/withdraw credits", menu)
+
+    async def test_depositing_credits(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20,
+                                       credits=5000)
+        self._station()
+
+        await self.dock()
+        prompt = await self.say("8")
+        self.assertIn("Treasury holds 0cr; you're carrying 5000cr", prompt)
+        prompt = await self.say("d")
+        self.assertIn("Deposit how much? You're carrying 5000cr", prompt)
+        reply = await self.say("3000")
+
+        self.assertIn("Deposited 3000cr into the treasury", reply)
+        self.assertIn("goes down with the station", reply)   # the fine print
+        self.assertIn("Treasury: 3000cr", reply)             # fresh status
+        self.assertEqual(STATE["player"]["credits"], 2000)
+        self.assertEqual(STATE["stations"][1]["credits"], 3000)
+
+    async def test_deposit_all_and_withdraw_all(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20,
+                                       credits=700)
+        self._station(credits=0)
+
+        await self.dock()
+        await self.say("8")
+        await self.say("d")
+        await self.say("all")
+        self.assertEqual(STATE["player"]["credits"], 0)
+        self.assertEqual(STATE["stations"][1]["credits"], 700)
+
+        await self.say("8")
+        await self.say("w")
+        reply = await self.say("all")
+        self.assertIn("Withdrew 700cr from the treasury", reply)
+        self.assertEqual(STATE["player"]["credits"], 700)
+        self.assertEqual(STATE["stations"][1]["credits"], 0)
+
+    async def test_cannot_deposit_more_than_carried(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20,
+                                       credits=100)
+        self._station()
+
+        await self.dock()
+        await self.say("8")
+        await self.say("d")
+        reply = await self.say("500")
+
+        self.assertIn("You're only carrying 100cr", reply)
+        self.assertEqual(STATE["player"]["credits"], 100)      # nothing moved
+        self.assertEqual(STATE["stations"][1]["credits"], 0)
+        # Still at the amount prompt -- a good number goes through.
+        reply = await self.say("100")
+        self.assertIn("Deposited 100cr", reply)
+
+    async def test_cannot_withdraw_more_than_the_treasury_holds(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20,
+                                       credits=0)
+        self._station(credits=50)
+
+        await self.dock()
+        await self.say("8")
+        await self.say("w")
+        reply = await self.say("500")
+
+        self.assertIn("The treasury only holds 50cr", reply)
+        self.assertEqual(STATE["stations"][1]["credits"], 50)
+
+    async def test_empty_pockets_and_empty_treasury_short_circuit(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20,
+                                       credits=0)
+        self._station(credits=0)
+
+        await self.dock()
+        await self.say("8")
+        reply = await self.say("d")
+        self.assertIn("not carrying any credits to deposit", reply)
+
+        await self.say("8")
+        reply = await self.say("w")
+        self.assertIn("The treasury is empty", reply)
+
+    async def test_destroying_a_station_burns_its_treasury(self):
+        STATE["player"] = fresh_player(id=2, name="Rival", sector_id=20,
+                                       fighters=500, credits=0)
+        self._station(owner_id=1, owner_name="Tester", fighters=0, shields=0,
+                      credits=90000)
+
+        await main.cmd_attack(self.ctx(), "station")
+        report = await main.cmd_attack_step(self.ctx(), "all")
+
+        self.assertIn("You destroyed Space Station - Tester!", report)
+        self.assertIn("Its treasury of 90000cr is lost to the void.", report)
+        self.assertEqual(STATE["player"]["credits"], 0)   # no looting
+        self.assertNotIn(1, STATE["stations"])
 
 
 if __name__ == "__main__":

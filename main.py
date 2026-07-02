@@ -611,6 +611,7 @@ def _station_target(station):
         "name": f"Space Station - {station['owner_name']}",
         "fighters": station["fighters"],
         "shields": station["shields"],
+        "credits": station.get("credits", 0),
     }
 
 
@@ -817,8 +818,14 @@ def _resolve_attack_on_station(ctx, target, engaged):
             f" {_plural(len(docked), 'docked ship')} went down with it."
             if docked else ""
         )
+        treasury = target.get("credits", 0)
+        treasury_note = (
+            f" Its treasury of {treasury}cr is lost to the void."
+            if treasury > 0 else ""
+        )
         return (
-            f"You destroyed {target['name']}! It's wreckage now.{docked_note} "
+            f"You destroyed {target['name']}! It's wreckage now.{docked_note}"
+            f"{treasury_note} "
             f"You have {fighters_after} fighters."
         )
 

@@ -251,6 +251,12 @@ hold territory, stockpile materials, and fight on your behalf.
 * **It's yours alone.** Only the owner can `dock` at a station to manage it.
   It appears on the sector info screen as **`Space Station - <owner>`** with
   its fighter count (shields stay hidden, just like ships).
+* **The treasury.** From the station menu, **deposit credits** into the
+  station's treasury (and withdraw them any time you dock). Credits in the
+  treasury aren't on you — so a **pod-kill's credit reset to 20,000cr can't
+  touch them**; only what you were carrying is at risk. The trade-off: if the
+  **station is destroyed, its entire treasury is lost** — not looted, just
+  gone (the attacker is told how much burned).
 * **Docking bays for your spare ships.** A station shelters your unmanned
   hulls: **2 bays per level** (Lvl 1 → 2 ships … Lvl 4 → 8). From the station
   menu, **Dock a spare ship** tucks any of your parked ships in the sector

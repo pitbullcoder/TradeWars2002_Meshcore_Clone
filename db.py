@@ -293,9 +293,21 @@ def init_db():
             engage_pct INTEGER NOT NULL DEFAULT 100,
             last_fuel_burn TEXT NOT NULL,
             upgrade_to INTEGER,
-            upgrade_started_at TEXT
+            upgrade_started_at TEXT,
+            credits INTEGER NOT NULL DEFAULT 0
         )
     """)
+
+    # The station's credit treasury -- a safe-deposit box for its owner.
+    # Deposited credits aren't on the player, so a pod-kill's credit
+    # reset can't touch them; the flip side is the whole treasury is lost
+    # if the station is destroyed (the row deletion takes it).
+    try:
+        conn.execute(
+            "ALTER TABLE stations ADD COLUMN credits INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass  # already has the column
 
     # Which station a spare (parked) ship is docked inside, NULL when it's
     # sitting out in the open. Docked ships are excluded from
@@ -1005,6 +1017,25 @@ def set_towing(player_id, ship_id):
     conn.execute(
         "UPDATE players SET towing_ship_id = ? WHERE id = ?",
         (ship_id, player_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def transfer_station_credits(player_id, station_id, amount):
+    """Move credits between a player's pocket and their station's
+    treasury in one transaction: positive `amount` deposits (player ->
+    treasury), negative withdraws. One statement pair, one commit -- a
+    radio drop mid-visit can never duplicate or vanish credits. Caller
+    validates ownership and that the source side can afford it."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE players SET credits = credits - ? WHERE id = ?",
+        (amount, player_id)
+    )
+    conn.execute(
+        "UPDATE stations SET credits = credits + ? WHERE id = ?",
+        (amount, station_id)
     )
     conn.commit()
     conn.close()

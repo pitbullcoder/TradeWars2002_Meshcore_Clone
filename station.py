@@ -30,6 +30,7 @@ from db import (
     get_ship,
     dock_ship_at_station,
     undock_ship,
+    transfer_station_credits,
     SAFE_ZONE_MAX_SECTOR,
     STATION_MAX_LEVEL,
     STATION_UPGRADES,
@@ -66,6 +67,7 @@ def build_station_status(station):
         cap = station_dock_capacity(station["level"])
         listed = ", ".join(f"{s['ship_type']} #{s['id']}" for s in docked)
         lines.append(f"Docked ships ({len(docked)}/{cap}): {listed}")
+    lines.append(f"Treasury: {station['credits']}cr")
     posture = station["posture"]
     if posture == "offensive":
         lines.append(f"Posture: offensive ({station['engage_pct']}% of fighters engage)")
@@ -91,6 +93,7 @@ def build_station_menu(station):
     lines.append(f"  6) Dock a spare ship ({len(docked)}/{cap} bays used)")
     if docked:
         lines.append("  7) Undock a ship")
+    lines.append("  8) Treasury -- deposit/withdraw credits")
     lines.append("Reply with a number, or 'exit'.")
     return "\n".join(lines)
 
@@ -150,7 +153,7 @@ async def cmd_station_step(ctx, message):
     Stardock, it's menu-driven and open-ended: each action returns to the
     menu until the player replies 'exit'/'cancel'. Stages: "menu",
     "transfer_qty", "posture_choose", "posture_pct", "upgrade_confirm",
-    "dock_choose", "undock_choose".
+    "dock_choose", "undock_choose", "treasury_choose", "treasury_amount".
     """
     pubkey = ctx.pubkey
     text = message.strip()
@@ -187,6 +190,10 @@ async def cmd_station_step(ctx, message):
         return _handle_dock_choose(ctx, state, station, p, lower)
     if stage == "undock_choose":
         return _handle_undock_choose(ctx, state, station, p, lower)
+    if stage == "treasury_choose":
+        return _handle_treasury_choose(ctx, state, station, p, lower)
+    if stage == "treasury_amount":
+        return _handle_treasury_amount(ctx, state, station, p, text)
 
     # Unknown stage -- reset to the menu defensively.
     state["stage"] = "menu"
@@ -223,6 +230,13 @@ def _handle_menu_choice(ctx, state, station, p, text):
         return _begin_dock(state, station, p)
     if text == "7":
         return _begin_undock(state, station, p)
+    if text == "8":
+        state["stage"] = "treasury_choose"
+        return (
+            f"Treasury holds {station['credits']}cr; you're carrying "
+            f"{p['credits']}cr. Reply 'd' to deposit or 'w' to withdraw "
+            "('cancel' to go back)."
+        )
     return "Reply with a number, or 'exit'." + _menu(station)
 
 
@@ -514,3 +528,62 @@ def _handle_undock_choose(ctx, state, station, p, lower):
         return line + "\n" + _undock_prompt(queue, idx)
 
     return "Reply 'yes' to undock it, 'no' for the next ship, 'all', or 'cancel'."
+
+
+def _handle_treasury_choose(ctx, state, station, p, lower):
+    if lower in ("cancel", "0"):
+        state["stage"] = "menu"
+        return "Treasury closed." + _menu(station)
+    if lower in ("d", "deposit"):
+        if p["credits"] <= 0:
+            state["stage"] = "menu"
+            return "You're not carrying any credits to deposit." + _menu(station)
+        state["stage"] = "treasury_amount"
+        state["direction"] = "deposit"
+        return (
+            f"Deposit how much? You're carrying {p['credits']}cr. "
+            "Reply with a number, 'all', or 'cancel'."
+        )
+    if lower in ("w", "withdraw"):
+        if station["credits"] <= 0:
+            state["stage"] = "menu"
+            return "The treasury is empty." + _menu(station)
+        state["stage"] = "treasury_amount"
+        state["direction"] = "withdraw"
+        return (
+            f"Withdraw how much? The treasury holds {station['credits']}cr. "
+            "Reply with a number, 'all', or 'cancel'."
+        )
+    return "Reply 'd' to deposit, 'w' to withdraw, or 'cancel'."
+
+
+def _handle_treasury_amount(ctx, state, station, p, text):
+    lower = text.lower()
+    depositing = state.get("direction") == "deposit"
+    available = p["credits"] if depositing else station["credits"]
+
+    if lower == "cancel":
+        state["stage"] = "menu"
+        return "Treasury closed." + _menu(station)
+    if lower == "all":
+        qty = available
+    elif text.isdigit():
+        qty = int(text)
+    else:
+        return f"Reply with a number from 1 to {available}, 'all', or 'cancel'."
+    if qty <= 0:
+        state["stage"] = "menu"
+        return "Nothing moved." + _menu(station)
+    if qty > available:
+        where = "You're only carrying" if depositing else "The treasury only holds"
+        return f"{where} {available}cr."
+
+    transfer_station_credits(p["id"], station["id"], qty if depositing else -qty)
+    state["stage"] = "menu"
+    fresh = get_station(station["id"])
+    if depositing:
+        line = (f"Deposited {qty}cr into the treasury -- it's safe there even "
+                "if you're blown up (but goes down with the station).")
+    else:
+        line = f"Withdrew {qty}cr from the treasury."
+    return line + _menu(fresh)
