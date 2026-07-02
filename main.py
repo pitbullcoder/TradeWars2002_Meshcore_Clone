@@ -64,6 +64,14 @@ from db import (
     apply_station_upkeep,
     set_station_defenses,
     delete_station,
+    get_ship,
+    get_parked_ships_in_sector,
+    set_parked_ship_defenses,
+    move_ship_to_sector,
+    delete_ship,
+    set_towing,
+    swap_active_ship,
+    spend_turns,
 )
 
 import session
@@ -85,6 +93,9 @@ from core import (
     PENDING_ATTACKS,
     PENDING_STATIONS,
     PENDING_P2P,
+    PENDING_TOWS,
+    PENDING_BOARDS,
+    ship_label,
     _warp_confirm_options,
     _resume_navigation_suffix,
 )
@@ -112,6 +123,8 @@ PENDING_UPGRADES.clear()
 PENDING_ATTACKS.clear()
 PENDING_STATIONS.clear()
 PENDING_P2P.clear()
+PENDING_TOWS.clear()
+PENDING_BOARDS.clear()
 session.ACTIVE_SESSION = None
 
 # Public surface this module deliberately exposes -- notably the handlers
@@ -126,11 +139,12 @@ __all__ = [
     "cmd_trade", "cmd_trade_step", "cmd_stardock_step",
     "cmd_p2p", "cmd_p2p_step",
     "cmd_deploy", "cmd_station", "cmd_station_step",
+    "cmd_tow", "cmd_tow_step", "cmd_board", "cmd_board_step",
     "enter_sector", "run_probe", "resolve_attack",
     "apply_mine_damage", "choose_escape_sector",
     "sectors_within_hop_range",
     "PENDING_WARPS", "PENDING_TRADES", "PENDING_UPGRADES", "PENDING_ATTACKS",
-    "PENDING_STATIONS", "PENDING_P2P",
+    "PENDING_STATIONS", "PENDING_P2P", "PENDING_TOWS", "PENDING_BOARDS",
     "on_message", "on_channel_message", "main",
 ]
 
@@ -157,6 +171,28 @@ MAX_SECTOR_ID = 1000  # matches galaxy.py's NUM_SECTORS
 # lose the pod -- they're wiped back to a fresh start: a default-hull ship
 # at the home sector with their credits reset to this amount.
 POD_KILL_RESET_CREDITS = 20000
+
+
+# --- Towing ------------------------------------------------------------
+# Dragging one of your own unmanned hulls behind you. Slow going: every
+# sector moved while towing burns this many turns instead of one, and a
+# move is refused outright when fewer remain (rather than burning the
+# player down to zero mid-haul).
+TOW_TURNS_PER_SECTOR = 5
+
+
+def _tow_move_block(p):
+    """The refusal message if `p` is towing but can't afford a towed
+    move (fewer than TOW_TURNS_PER_SECTOR turns left), else None. Called
+    before any player-initiated sector move actually happens, so a
+    too-expensive move never half-fires."""
+    if p.get("towing_ship_id") and p["turns_remaining"] < TOW_TURNS_PER_SECTOR:
+        return (
+            f"Towing burns {TOW_TURNS_PER_SECTOR} turns per sector and you have "
+            f"{p['turns_remaining']} left. Release the tow ('tow') to travel light, "
+            "or wait for the daily reset."
+        )
+    return None
 
 
 # --- Public kill log --------------------------------------------------
@@ -207,9 +243,17 @@ async def cmd_status(ctx, args):
         defenses += f" Mines {p['mines']}"
     if p["probes"] > 0:
         defenses += f" Probes {p['probes']}"
+    towing_line = ""
+    if p.get("towing_ship_id"):
+        towed = get_ship(p["towing_ship_id"])
+        if towed is not None:
+            towing_line = (
+                f"\nTowing {towed['ship_type']} #{towed['id']} "
+                f"({TOW_TURNS_PER_SECTOR} turns/sector)"
+            )
     return (
         f"Sec{p['sector_id']} {p['credits']}cr {p['turns_remaining']}turn\n"
-        f"{p['ship_type']}\n"
+        f"{p['ship_type']}{towing_line}\n"
         f"{defenses}\n"
         f"fuel{p['fuel_ore']} organics{p['organics']} equipment{p['equipment']}\n"
         f"{format_warps_line(p['sector_id'])}\n"
@@ -430,17 +474,26 @@ def run_probe(p, path):
     return "\n".join(lines)
 
 
-@command("a", "attack", description="attack a ship in your sector: 'a <name>'", menu="combat")
+@command("a", "attack", description="attack a ship here: 'a', 'a <name>', or 'a #<ship id>'", menu="combat")
 async def cmd_attack(ctx, args):
     """
-    Aim an attack at another pilot in your sector. Rather than throwing
-    every fighter at them at once, this picks the target and then asks how
-    many fighters to commit (see cmd_attack_step, which does the actual
-    resolving via resolve_attack). Combat is banned in the
-    Sec1..SAFE_ZONE_MAX_SECTOR safe zone, so this is refused there. Only
-    works when someone else is here and you have fighters to send. Sets up
-    PENDING_ATTACKS and returns the "how many fighters?" prompt; the
-    follow-up reply is routed to cmd_attack_step by on_message.
+    Aim an attack at something in your sector: another pilot's ship, an
+    unmanned (parked) ship, or an enemy space station. Three forms:
+
+      a <name>     -- target a pilot by name directly
+      a #<ship id> -- target an unmanned ship by its id (as shown on the
+                      sector-info "Unmanned:" line)
+      a station    -- target the enemy station here
+      a            -- guided: cycles yes/no through every target present,
+                      pilots first, then unmanned ships, then the station
+
+    Rather than throwing every fighter at once, a chosen target leads to
+    a "how many fighters?" prompt (see cmd_attack_step, which resolves
+    via resolve_attack). Combat is banned in the
+    Sec1..SAFE_ZONE_MAX_SECTOR safe zone -- which also makes ships parked
+    there (e.g. at the Stardock) unattackable. You can't attack your own
+    parked ships. Sets up PENDING_ATTACKS; the follow-up reply is routed
+    to cmd_attack_step by on_message.
     """
     p = ctx.player  # attacker
 
@@ -451,6 +504,8 @@ async def cmd_attack(ctx, args):
         )
 
     foes = get_ships_in_sector(p["sector_id"], p["id"])
+    parked_here = get_parked_ships_in_sector(p["sector_id"])
+    enemy_parked = [s for s in parked_here if s["owner_id"] != p["id"]]
     station = get_station_in_sector(p["sector_id"])
     enemy_station = station if (station is not None and station["owner_id"] != p["id"]) else None
 
@@ -458,42 +513,85 @@ async def cmd_attack(ctx, args):
     if arg.lower() == "station":
         if enemy_station is None:
             return "There's no enemy station here to attack."
-        target = _station_target(enemy_station)
-    elif not foes and enemy_station is None:
-        return "No other ships here to attack."
-    elif arg:
+        return _aim_attack(ctx, _station_target(enemy_station))
+
+    id_match = re.match(r"^#(\d+)$", arg)
+    if id_match:
+        ship_id = int(id_match.group(1))
+        ship = next((s for s in parked_here if s["id"] == ship_id), None)
+        if ship is None:
+            return f"No unmanned ship #{ship_id} here."
+        if ship["owner_id"] == p["id"]:
+            return f"{ship_label(ship)} is your own ship -- you can't attack it."
+        return _aim_attack(ctx, _parked_target(ship))
+
+    if arg:
         ship = next((f for f in foes if f["name"].lower() == arg.lower()), None)
         if ship is None:
             here = ", ".join(f["name"] for f in foes) or "none"
             hint = " (or 'a station')" if enemy_station else ""
+            if enemy_parked:
+                hint += " ('a #<id>' for an unmanned ship)"
             return f"No ship named '{arg}' here. Ships here: {here}{hint}."
-        target = ship
-    else:
-        options = len(foes) + (1 if enemy_station else 0)
-        if options == 1:
-            target = foes[0] if foes else _station_target(enemy_station)
-        else:
-            here = ", ".join(f["name"] for f in foes)
-            extra = ""
-            if enemy_station:
-                extra = (("; " if here else "")
-                         + f"Space Station - {enemy_station['owner_name']} (type 'a station')")
-            return f"Attack who? Targets: {here}{extra}. Try 'a <name>'."
+        return _aim_attack(ctx, _player_target(ship))
 
+    # Bare 'a': walk the targets one at a time -- pilots, then unmanned
+    # ships, then the enemy station -- asking yes/no for each.
+    queue = (
+        [_player_target(f) for f in foes]
+        + [_parked_target(s) for s in enemy_parked]
+        + ([_station_target(enemy_station)] if enemy_station else [])
+    )
+    if not queue:
+        return "No other ships here to attack."
+    if p["fighters"] <= 0:
+        return "You have no fighters to attack with."
+    PENDING_ATTACKS[ctx.pubkey] = {"stage": "choose", "queue": queue, "idx": 0}
+    return _attack_choose_prompt(queue, 0)
+
+
+def _attack_choose_prompt(queue, idx):
+    target = queue[idx]
+    more = " (no = next target)" if idx + 1 < len(queue) else ""
+    return f"Attack {target['name']} ({target['fighters']} ftr)? yes/no{more}"
+
+
+def _player_target(ship):
+    """Attack-target dict for another pilot's (manned) ship."""
+    return {"kind": "player", "id": ship["id"], "name": ship["name"],
+            "fighters": ship["fighters"]}
+
+
+def _parked_target(ship):
+    """Attack-target dict for an unmanned parked/towed ship, shaped like
+    the others (with is_parked to branch on at resolution)."""
+    return {
+        "kind": "parked",
+        "is_parked": True,
+        "ship_id": ship["id"],
+        "owner_id": ship["owner_id"],
+        "name": ship_label(ship),
+        "fighters": ship["fighters"],
+        "shields": ship["shields"],
+    }
+
+
+def _aim_attack(ctx, target):
+    """Lock PENDING_ATTACKS onto `target` and return the fighter-count
+    prompt -- the shared tail of every cmd_attack form (and of a 'yes' in
+    the guided cycle)."""
+    p = ctx.player
     if p["fighters"] <= 0:
         return "You have no fighters to attack with."
 
-    if target.get("is_station"):
-        PENDING_ATTACKS[ctx.pubkey] = {
-            "is_station": True,
-            "station_id": target["station_id"],
-            "target_name": target["name"],
-        }
+    pending = {"stage": "fighters", "kind": target["kind"], "target_name": target["name"]}
+    if target["kind"] == "station":
+        pending["station_id"] = target["station_id"]
+    elif target["kind"] == "parked":
+        pending["ship_id"] = target["ship_id"]
     else:
-        PENDING_ATTACKS[ctx.pubkey] = {
-            "target_id": target["id"],
-            "target_name": target["name"],
-        }
+        pending["target_id"] = target["id"]
+    PENDING_ATTACKS[ctx.pubkey] = pending
     return (
         f"Attack {target['name']} with how many fighters? "
         f"You have {p['fighters']}. Reply with a number, 'all', or 'cancel'."
@@ -505,6 +603,7 @@ def _station_target(station):
     ship target that the fighter-commitment prompt and resolver can treat
     them the same (with is_station to branch on)."""
     return {
+        "kind": "station",
         "is_station": True,
         "station_id": station["id"],
         "owner_id": station["owner_id"],
@@ -532,6 +631,30 @@ async def cmd_attack_step(ctx, message):
         return "No attack in progress."
 
     text = message.strip().lower()
+
+    if pending.get("stage") == "choose":
+        # Guided target cycle: 'yes' locks onto the current target and
+        # falls through to the fighter-count prompt; 'no' moves on to the
+        # next target (calling the whole thing off when the list runs
+        # out); 'cancel' stops immediately.
+        queue, idx = pending["queue"], pending["idx"]
+        if text in ("cancel",):
+            PENDING_ATTACKS.pop(pubkey, None)
+            return f"Attack called off. You remain in Sec{p['sector_id']}."
+        if text in ("n", "no"):
+            idx += 1
+            if idx >= len(queue):
+                PENDING_ATTACKS.pop(pubkey, None)
+                return "Attack called off -- no more targets here."
+            pending["idx"] = idx
+            return _attack_choose_prompt(queue, idx)
+        if text in ("y", "yes"):
+            return _aim_attack(ctx, queue[idx])
+        return (
+            f"Reply 'yes' to attack {queue[idx]['name']}, 'no' for the next "
+            "target, or 'cancel'."
+        )
+
     if text in ("n", "no", "cancel"):
         PENDING_ATTACKS.pop(pubkey, None)
         return f"Attack called off. You remain in Sec{p['sector_id']}."
@@ -558,13 +681,21 @@ async def cmd_attack_step(ctx, message):
         return f"You only have {available} fighters aboard. Pick up to that, or 'cancel'."
 
     # Re-fetch the target's current state -- it must still be in the sector.
-    if pending.get("is_station"):
+    kind = pending.get("kind", "station" if pending.get("is_station") else "player")
+    if kind == "station":
         station = get_station_in_sector(p["sector_id"])
         if station is None or station["id"] != pending["station_id"]:
             PENDING_ATTACKS.pop(pubkey, None)
             return f"{pending['target_name']} is no longer here. Attack called off."
         station = apply_station_upkeep(station["id"])
         target = _station_target(station)
+    elif kind == "parked":
+        parked_here = get_parked_ships_in_sector(p["sector_id"])
+        ship = next((s for s in parked_here if s["id"] == pending["ship_id"]), None)
+        if ship is None:
+            PENDING_ATTACKS.pop(pubkey, None)
+            return f"{pending['target_name']} is no longer here. Attack called off."
+        target = _parked_target(ship)
     else:
         foes = get_ships_in_sector(p["sector_id"], p["id"])
         target = next((f for f in foes if f["id"] == pending["target_id"]), None)
@@ -595,6 +726,8 @@ def _resolve_attack(ctx, target, engaged):
 
     if target.get("is_station"):
         return _resolve_attack_on_station(ctx, target, engaged)
+    if target.get("is_parked"):
+        return _resolve_attack_on_parked(ctx, target, engaged)
 
     atk_after, df_after, ds_after, destroyed = resolve_attack(
         engaged, target["fighters"], target["shields"]
@@ -686,6 +819,42 @@ def _resolve_attack_on_station(ctx, target, engaged):
     )
 
 
+def _resolve_attack_on_parked(ctx, target, engaged):
+    """
+    Resolve a committed attack against an unmanned (parked or towed)
+    ship. Same fighter-vs-fighter / fighter-vs-shield math -- the hull
+    defends itself with whatever fighters and shields were left aboard
+    when it was parked. Nobody's flying it, so a kill just removes the
+    hull (no pod, no pilot relocation) and, like a station, it does NOT
+    go in the public kill log; the owner gets a sign-in notice either
+    way. Returns the attacker-facing report.
+    """
+    p = ctx.player
+
+    atk_after, df_after, ds_after, destroyed = resolve_attack(
+        engaged, target["fighters"], target["shields"]
+    )
+    fighters_after = (p["fighters"] - engaged) + atk_after
+    spent = engaged - atk_after
+    set_ship_defenses(p["id"], p["shields"], fighters_after)  # keep shields, spend fighters
+
+    if destroyed:
+        delete_ship(target["ship_id"])
+        record_attack_event(target["owner_id"], p["name"], p["sector_id"], "unmanned_destroyed")
+        return (
+            f"You destroyed the unmanned {target['name']}! It's wreckage now. "
+            f"You have {fighters_after} fighters."
+        )
+
+    set_parked_ship_defenses(target["ship_id"], ds_after, df_after)
+    record_attack_event(target["owner_id"], p["name"], p["sector_id"], "unmanned_attacked")
+    return (
+        f"You hit the unmanned {target['name']} with {_plural(spent, 'fighter')}! "
+        f"It's left with {df_after} fighters, {ds_after} shields. "
+        f"You have {fighters_after} fighters."
+    )
+
+
 def format_attack_notices(events):
     """Turn queued attack_events (oldest first) into the sign-in briefing a
     victim sees -- one line each, phrased by outcome, tagged with when."""
@@ -694,6 +863,8 @@ def format_attack_notices(events):
         "destroyed": "{who} destroyed your ship in Sec{sec}; you ejected in a pod",
         "pod_destroyed": "{who} blew up your escape pod in Sec{sec}; you were reset",
         "station_destroyed": "{who} destroyed your space station in Sec{sec}",
+        "unmanned_attacked": "{who} attacked your unmanned ship in Sec{sec}",
+        "unmanned_destroyed": "{who} destroyed your unmanned ship in Sec{sec}",
     }
     lines = ["While you were away:"]
     for e in events:
@@ -759,13 +930,38 @@ def enter_sector(ctx, sector_id, lead, rng=None):
     r = rng if rng is not None else random
     pubkey = ctx.pubkey
 
+    # A towed hull is dragged along: it relocates with the player and the
+    # move costs TOW_TURNS_PER_SECTOR turns instead of one (the caller has
+    # already refused the move if that can't be afforded -- see
+    # _tow_move_block). A dangling towing_ship_id (ship destroyed or sold
+    # out from under the tow) is quietly dropped.
+    towed = None
+    towing_id = ctx.player.get("towing_ship_id")
+    if towing_id:
+        towed = get_ship(towing_id)
+        if towed is None:
+            set_towing(ctx.player["id"], None)
+
     move_player_to_sector(ctx.player["id"], sector_id)
-    spend_turn(ctx.player["id"])  # each sector-to-sector move costs a turn
+    if towed is not None:
+        spend_turns(ctx.player["id"], TOW_TURNS_PER_SECTOR)
+        move_ship_to_sector(towed["id"], sector_id)
+        tow_note = f" Towing {ship_label(towed)}: -{TOW_TURNS_PER_SECTOR} turns."
+    else:
+        spend_turn(ctx.player["id"])  # each sector-to-sector move costs a turn
+        tow_note = ""
+    # If the player is destroyed below, the tow line goes with the hull
+    # (every destruction path swaps the hull via buy_ship, which clears
+    # towing_ship_id) and the towed ship is left adrift right here.
+    tow_lost_note = (
+        f"\nYour tow line snaps -- {ship_label(towed)} is left adrift in Sec{sector_id}."
+        if towed is not None else ""
+    )
     p = get_player_with_ship(pubkey)  # fresh defenses to test the hit against
 
     hostile = get_hostile_mine_total(sector_id, p["id"])
     if hostile <= 0:
-        arrival_line = f"{lead} Sec{sector_id}."
+        arrival_line = f"{lead} Sec{sector_id}.{tow_note}"
     else:
         # The mines go off and are spent, kill or not.
         clear_hostile_mines(sector_id, p["id"])
@@ -794,7 +990,8 @@ def enter_sector(ctx, sector_id, lead, rng=None):
                 message = (
                     f"{_plural(hostile, 'mine')} detonate for {total_damage} damage -- your "
                     f"Escape Pod is GONE! You lose everything and restart with "
-                    f"{POD_KILL_RESET_CREDITS}cr in a {DEFAULT_SHIP_TYPE} at the Stardock.\n"
+                    f"{POD_KILL_RESET_CREDITS}cr in a {DEFAULT_SHIP_TYPE} at the Stardock."
+                    f"{tow_lost_note}\n"
                     f"{build_sector_info(HOME_SECTOR, p['id'])}"
                 )
                 return message, True
@@ -814,7 +1011,8 @@ def enter_sector(ctx, sector_id, lead, rng=None):
             message = (
                 f"{_plural(hostile, 'mine')} detonate for {total_damage} damage -- your "
                 f"{p['ship_type']} is DESTROYED! You eject in an Escape Pod and drift to "
-                f"Sec{landed} (cargo lost, credits intact).\n{build_sector_info(landed, p['id'])}"
+                f"Sec{landed} (cargo lost, credits intact)."
+                f"{tow_lost_note}\n{build_sector_info(landed, p['id'])}"
             )
             return message, True
 
@@ -824,7 +1022,7 @@ def enter_sector(ctx, sector_id, lead, rng=None):
         arrival_line = (
             f"{lead} Sec{sector_id} -- {_plural(hostile, 'mine')} detonate for "
             f"{total_damage} damage! Lost {shields_lost} shields, {fighters_lost} fighters; "
-            f"now {shields_after} shields, {fighters_after} fighters."
+            f"now {shields_after} shields, {fighters_after} fighters.{tow_note}"
         )
 
     # An offensive station here opens fire on a non-owner who just arrived
@@ -832,7 +1030,8 @@ def enter_sector(ctx, sector_id, lead, rng=None):
     # them. If it destroys them, that result is returned directly.
     station_line, destroyed_result = _station_offensive_on_entry(ctx, sector_id)
     if destroyed_result is not None:
-        return destroyed_result
+        msg, was_destroyed = destroyed_result
+        return msg + tow_lost_note, was_destroyed
     p = get_player_with_ship(pubkey)
     return f"{arrival_line}{station_line}\n{build_sector_info(sector_id, p['id'])}", False
 
@@ -924,6 +1123,217 @@ def _station_offensive_on_entry(ctx, sector_id):
     ), None
 
 
+@command("tow", description="tow one of your parked ships (5 turns/sector): 'tow' or 'tow #<id>'")
+async def cmd_tow(ctx, args):
+    """
+    Attach a tow line to one of YOUR OWN unmanned ships in this sector --
+    or, if a tow is already engaged, release it (the hull stays put
+    wherever you are). While towing, every sector move drags the hull
+    along and burns TOW_TURNS_PER_SECTOR turns instead of one; a move is
+    refused when fewer remain. Forms:
+
+      tow          -- guided: cycles yes/no through your ships parked here
+                      (see cmd_tow_step); releases if already towing
+      tow #<id>    -- tow that ship directly (must be yours, must be here)
+
+    Ships belonging to other players can never be towed. An Escape Pod
+    has no tow rig. Engaging is free; the cost lands on each move.
+    """
+    p = ctx.player
+
+    if p.get("towing_ship_id"):
+        towed = get_ship(p["towing_ship_id"])
+        set_towing(p["id"], None)
+        name = ship_label(towed) if towed else "the hull"
+        return f"Tow released -- {name} stays parked in Sec{p['sector_id']}."
+
+    if p["ship_type"] == ESCAPE_POD_SHIP:
+        return "An escape pod has no tow rig."
+
+    parked_here = get_parked_ships_in_sector(p["sector_id"])
+    own = [s for s in parked_here if s["owner_id"] == p["id"]]
+
+    arg = args.strip()
+    id_match = re.match(r"^#?(\d+)$", arg)
+    if id_match:
+        ship_id = int(id_match.group(1))
+        ship = next((s for s in parked_here if s["id"] == ship_id), None)
+        if ship is None:
+            return f"No unmanned ship #{ship_id} here."
+        if ship["owner_id"] != p["id"]:
+            return f"{ship_label(ship)} isn't yours -- you can only tow your own ships."
+        return _engage_tow(ctx, ship)
+    if arg:
+        return "Try 'tow' to pick from your ships here, or 'tow #<ship id>'."
+
+    if not own:
+        if parked_here:
+            return "None of the unmanned ships here are yours -- you can only tow your own."
+        return "No unmanned ships here to tow."
+
+    PENDING_TOWS[ctx.pubkey] = {"queue": own, "idx": 0}
+    return _tow_choose_prompt(own, 0)
+
+
+def _tow_choose_prompt(queue, idx):
+    more = " (no = next ship)" if idx + 1 < len(queue) else ""
+    return f"Tow your {queue[idx]['ship_type']} #{queue[idx]['id']}? yes/no{more}"
+
+
+def _engage_tow(ctx, ship):
+    p = ctx.player
+    set_towing(p["id"], ship["id"])
+    return (
+        f"Tow line attached to {ship_label(ship)}. WARNING: towing burns "
+        f"{TOW_TURNS_PER_SECTOR} turns per sector moved (you have "
+        f"{p['turns_remaining']}). 'tow' again to release."
+    )
+
+
+async def cmd_tow_step(ctx, message):
+    """
+    Advance a guided tow pick (PENDING_TOWS): 'yes' attaches the line to
+    the ship on offer, 'no' moves to the next of the player's own ships
+    here, 'cancel' (or running out of ships) calls it off. The ship is
+    re-fetched on 'yes' -- it must still exist, still be theirs, and
+    still be in this sector.
+    """
+    pubkey = ctx.pubkey
+    p = ctx.player
+    text = message.strip().lower()
+
+    state = PENDING_TOWS.get(pubkey)
+    if not state:
+        PENDING_TOWS.pop(pubkey, None)
+        return "No tow in progress."
+
+    queue, idx = state["queue"], state["idx"]
+    if text in ("cancel",):
+        PENDING_TOWS.pop(pubkey, None)
+        return "Tow called off."
+    if text in ("n", "no"):
+        idx += 1
+        if idx >= len(queue):
+            PENDING_TOWS.pop(pubkey, None)
+            return "Tow called off -- no more of your ships here."
+        state["idx"] = idx
+        return _tow_choose_prompt(queue, idx)
+    if text in ("y", "yes"):
+        PENDING_TOWS.pop(pubkey, None)
+        ship = get_ship(queue[idx]["id"])
+        if (ship is None or ship["owner_id"] != p["id"]
+                or ship["sector_id"] != p["sector_id"]):
+            return "That ship is no longer here. Tow called off."
+        return _engage_tow(ctx, ship)
+    return (
+        f"Reply 'yes' to tow your {queue[idx]['ship_type']} #{queue[idx]['id']}, "
+        "'no' for the next, or 'cancel'."
+    )
+
+
+@command("board", "swap", description="board one of your parked ships here: 'board' or 'board #<id>'")
+async def cmd_board(ctx, args):
+    """
+    Swap into one of YOUR OWN unmanned ships in this sector: your current
+    hull is parked here in its place (with everything aboard it), and you
+    take the helm of the other -- exactly as it was left. A pilot in an
+    Escape Pod can board a ship they own, scuttling the pod (that's the
+    cheap way back from a wreck if you kept a spare). A free action, like
+    docking; any tow in progress is released. Forms:
+
+      board        -- guided: cycles yes/no through your ships parked here
+      board #<id>  -- board that ship directly
+
+    Other players' ships can't be boarded.
+    """
+    p = ctx.player
+
+    parked_here = get_parked_ships_in_sector(p["sector_id"])
+    own = [s for s in parked_here if s["owner_id"] == p["id"]]
+
+    arg = args.strip()
+    id_match = re.match(r"^#?(\d+)$", arg)
+    if id_match:
+        ship_id = int(id_match.group(1))
+        ship = next((s for s in parked_here if s["id"] == ship_id), None)
+        if ship is None:
+            return f"No unmanned ship #{ship_id} here."
+        if ship["owner_id"] != p["id"]:
+            return f"{ship_label(ship)} isn't yours -- you can't board it."
+        return _do_board(ctx, ship)
+    if arg:
+        return "Try 'board' to pick from your ships here, or 'board #<ship id>'."
+
+    if not own:
+        if parked_here:
+            return "None of the unmanned ships here are yours -- you can only board your own."
+        return "No unmanned ships here to board."
+
+    PENDING_BOARDS[ctx.pubkey] = {"queue": own, "idx": 0}
+    return _board_choose_prompt(own, 0)
+
+
+def _board_choose_prompt(queue, idx):
+    more = " (no = next ship)" if idx + 1 < len(queue) else ""
+    return f"Board your {queue[idx]['ship_type']} #{queue[idx]['id']}? yes/no{more}"
+
+
+def _do_board(ctx, ship):
+    p = ctx.player
+    was_pod = p["ship_type"] == ESCAPE_POD_SHIP
+    old_ship_id = p.get("ship_id")
+    swap_active_ship(p["id"], ship["id"], p["sector_id"])
+    np = get_player_with_ship(ctx.pubkey)
+    if was_pod:
+        left_behind = "your escape pod is scuttled"
+    else:
+        left_behind = f"your {p['ship_type']} #{old_ship_id} is parked here"
+    return (
+        f"You board your {ship['ship_type']} #{ship['id']} -- {left_behind}. "
+        f"Aboard: {np['fighters']} ftr, {np['shields']} shd, cargo "
+        f"f{np['fuel_ore']}/o{np['organics']}/e{np['equipment']}."
+    )
+
+
+async def cmd_board_step(ctx, message):
+    """
+    Advance a guided board pick (PENDING_BOARDS): same yes/no/cancel
+    cycle as cmd_tow_step, ending in _do_board on a 'yes' (with the ship
+    re-fetched and re-validated first).
+    """
+    pubkey = ctx.pubkey
+    p = ctx.player
+    text = message.strip().lower()
+
+    state = PENDING_BOARDS.get(pubkey)
+    if not state:
+        PENDING_BOARDS.pop(pubkey, None)
+        return "No boarding in progress."
+
+    queue, idx = state["queue"], state["idx"]
+    if text in ("cancel",):
+        PENDING_BOARDS.pop(pubkey, None)
+        return "Boarding called off."
+    if text in ("n", "no"):
+        idx += 1
+        if idx >= len(queue):
+            PENDING_BOARDS.pop(pubkey, None)
+            return "Boarding called off -- no more of your ships here."
+        state["idx"] = idx
+        return _board_choose_prompt(queue, idx)
+    if text in ("y", "yes"):
+        PENDING_BOARDS.pop(pubkey, None)
+        ship = get_ship(queue[idx]["id"])
+        if (ship is None or ship["owner_id"] != p["id"]
+                or ship["sector_id"] != p["sector_id"]):
+            return "That ship is no longer here. Boarding called off."
+        return _do_board(ctx, ship)
+    return (
+        f"Reply 'yes' to board your {queue[idx]['ship_type']} #{queue[idx]['id']}, "
+        "'no' for the next, or 'cancel'."
+    )
+
+
 async def cmd_move(ctx, args):
     """
     Handle a number-like message as a move request.
@@ -951,6 +1361,9 @@ async def cmd_move(ctx, args):
 
     adjacent = get_adjacent_sectors(p["sector_id"])
     if target in adjacent:
+        block = _tow_move_block(p)
+        if block:
+            return block
         message, _destroyed = enter_sector(ctx, target, "Moved to")
         return message
 
@@ -1005,6 +1418,11 @@ async def cmd_confirm_warp(ctx, message):
         return response
 
     if text in ("y", "yes"):
+        block = _tow_move_block(p)
+        if block:
+            # The hop is NOT consumed -- the route stays plotted so the
+            # player can cancel it ('no'), free the tow, and resume.
+            return block + " (Reply 'no' to cancel this route first.)"
         next_sector = remaining.pop(0)
         last_hop = not remaining
         message, destroyed = enter_sector(
@@ -1161,6 +1579,9 @@ async def cmd_p2p(ctx, args):
     leg's move-and-trade mechanics.
     """
     p = ctx.player
+
+    if p.get("towing_ship_id"):
+        return "Can't run a P2P shuttle while towing. Release the tow first ('tow')."
     home_sector = p["sector_id"]
     home_port = get_port(home_sector)
     if home_port is None or home_port["port_class"] == "STARDOCK":
@@ -1540,6 +1961,10 @@ async def on_message(mc, event):
         response = await cmd_station_step(ctx, message)
     elif pubkey in PENDING_P2P:
         response = await cmd_p2p_step(ctx, message)
+    elif pubkey in PENDING_TOWS:
+        response = await cmd_tow_step(ctx, message)
+    elif pubkey in PENDING_BOARDS:
+        response = await cmd_board_step(ctx, message)
     elif pubkey in PENDING_WARPS:
         response = await cmd_confirm_warp(ctx, message)
     else:

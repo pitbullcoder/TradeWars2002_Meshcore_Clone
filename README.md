@@ -165,6 +165,39 @@ At the **Stardock** (Sector 1) you can:
 * Buy a **Space Station Core kit** (see *Space stations* below) to build your
   own station out in the galaxy.
 
+### Owning more than one ship
+
+You aren't limited to a single hull. When you **buy a ship at the shipyard**
+you're asked whether to **sell your current ship as a trade-in** (50% of its
+catalog price off the new hull) or **keep it** — keeping it means paying the
+new hull's **full price**, and your old ship is **parked, unmanned, right
+there in the sector** with everything still aboard (cargo, fighters, shields,
+mines, probes, even a carried Station Core kit).
+
+* Parked ships appear on the sector info screen on an **`Unmanned:`** line,
+  named by **owner and type with a ship id** — e.g. `Joe's Kestrel #12
+  (5 ftr)`. The id is how you target one (`board #12`, `tow #12`, `a #12`).
+* **`board`** (alias `swap`) takes the helm of one of your own parked ships
+  in the sector; your current hull is parked in its place, exactly as it is.
+  Boarding is free (no turn cost). A pilot stuck in an **escape pod** can
+  board a ship they own — the pod is scuttled — which makes a parked spare a
+  genuine insurance policy against losing your flagship.
+* **`tow`** drags one of your own unmanned hulls behind you. It's slow:
+  **every sector moved while towing costs 5 turns** instead of 1 (you're
+  warned when you engage, and a move is refused outright if you have fewer
+  than 5 turns left). `tow` again releases the line. Only **your own** ships
+  can ever be towed, an escape pod can't tow, and P2P shuttles won't run
+  while towing.
+* **Selling a parked ship**: tow (or leave) an unmanned hull in Sector 1 and
+  the shipyard menu lists it — `s12) Sell your parked Kestrel #12` — for 50%
+  of its catalog price. It's sold **as-is**: anything still aboard is lost
+  with it.
+* **Unmanned ships can be attacked** (outside the safe zone — hulls parked in
+  Sectors 1–10, including at the Stardock, are protected). They defend with
+  whatever fighters and shields were left aboard, using the normal combat
+  math. A destroyed unmanned ship is simply gone — no pod, no kill-log entry
+  — but the owner gets a while-you-were-away notice.
+
 ### Navigation
 
 * Type a **sector number** to move. Adjacent sectors are a single warp.
@@ -175,9 +208,11 @@ At the **Stardock** (Sector 1) you can:
 
 ### Combat
 
-* Attack another pilot in your sector with `a <name>` (or just `a` if only
-  one other ship is present). Combat is **not allowed in the safe zone
-  (Sectors 1–10)**.
+* Attack another pilot in your sector with `a <name>`, an unmanned parked
+  ship with `a #<id>`, or a station with `a station`. A bare `a` walks you
+  through **every target present one at a time** — pilots first, then
+  unmanned ships, then an enemy station — with a yes/no prompt for each.
+  Combat is **not allowed in the safe zone (Sectors 1–10)**.
 * You're asked **how many fighters to commit** — send a number, `all`, or
   `cancel`. Fighters you hold back are never at risk.
 * Resolution: your fighters clash with the defender's first (you spend
@@ -288,7 +323,9 @@ Send these as direct messages to the game node.
 | `p`     | `port` | Dock to trade, or to refit / visit the shipyard / buy a Station Core kit at a Stardock. |
 | `jettison <what>` | `jet` | Dump cargo from your holds to free up space: `jettison all`, or `jettison <commodity> [n]`. |
 | `p2p <sector>` | | Auto-shuttle trade with an adjacent complementary port; pick a commodity, then `y`/`n` to keep running. |
-| `a <name>` | `attack <name>` | Attack a ship in your sector (then commit fighters). Use `a station` to attack a space station. |
+| `a [target]` | `attack` | Attack a ship here (then commit fighters): `a <name>` for a pilot, `a #<id>` for an unmanned ship, `a station` for a station, or bare `a` to cycle through every target. |
+| `tow [#<id>]` | | Tow one of your own unmanned ships (5 turns per sector moved); `tow` again releases. |
+| `board [#<id>]` | `swap` | Board one of your own unmanned ships here; your current hull is parked in its place (a pod is scuttled). |
 | `deploy` | | Deploy a carried Space Station Core kit in your current sector (outside Sectors 1–10). |
 | `station` | `dock` | Dock at your own space station here to deposit materials, transfer fighters, power shields, set posture, and upgrade. |
 | `lay <n>` | `mine <n>` | Lay `n` mines in your current sector (needs a ship with a mine bay). |

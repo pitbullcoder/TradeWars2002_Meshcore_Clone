@@ -98,10 +98,15 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # already has the column
 
+    # A player may own several ships. Exactly one is "active" (the hull
+    # they're flying), pointed at by players.active_ship_id; the rest are
+    # parked. sector_id is where a NON-active ship sits (an active ship's
+    # location is its owner's players.sector_id, and its sector_id is
+    # NULL). player_id is the OWNER -- deliberately not unique anymore.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ships (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_id INTEGER NOT NULL UNIQUE REFERENCES players(id),
+            player_id INTEGER NOT NULL REFERENCES players(id),
             ship_type TEXT NOT NULL,
             holds_total INTEGER NOT NULL,
             fighters INTEGER NOT NULL DEFAULT 0,
@@ -111,9 +116,11 @@ def init_db():
             fuel_ore INTEGER NOT NULL DEFAULT 0,
             organics INTEGER NOT NULL DEFAULT 0,
             equipment INTEGER NOT NULL DEFAULT 0,
-            station_core INTEGER NOT NULL DEFAULT 0
+            station_core INTEGER NOT NULL DEFAULT 0,
+            sector_id INTEGER REFERENCES sectors(id)
         )
     """)
+
     # Migration for databases created before mines existed -- CREATE
     # TABLE IF NOT EXISTS above is a no-op against an already-existing
     # ships table, so this adds the column on its own for anyone running
@@ -135,6 +142,73 @@ def init_db():
     # kit (which also occupies STATION_CORE_HOLDS holds while carried).
     try:
         conn.execute("ALTER TABLE ships ADD COLUMN station_core INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # already has the column
+
+    # Migration for databases created back when a player could only own
+    # one ship: the old schema had UNIQUE on ships.player_id (and no
+    # sector_id column). SQLite can't drop a constraint in place, so the
+    # table is rebuilt: copy every row into a new UNIQUE-less table (all
+    # existing ships are active, so sector_id starts NULL), then swap it
+    # in. Detected by the UNIQUE keyword in the stored table SQL; a table
+    # freshly created by the statement above never matches.
+    ships_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ships'"
+    ).fetchone()["sql"]
+    if "UNIQUE" in ships_sql.upper():
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("""
+            CREATE TABLE ships_multi (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_id INTEGER NOT NULL REFERENCES players(id),
+                ship_type TEXT NOT NULL,
+                holds_total INTEGER NOT NULL,
+                fighters INTEGER NOT NULL DEFAULT 0,
+                shields INTEGER NOT NULL DEFAULT 0,
+                mines INTEGER NOT NULL DEFAULT 0,
+                probes INTEGER NOT NULL DEFAULT 0,
+                fuel_ore INTEGER NOT NULL DEFAULT 0,
+                organics INTEGER NOT NULL DEFAULT 0,
+                equipment INTEGER NOT NULL DEFAULT 0,
+                station_core INTEGER NOT NULL DEFAULT 0,
+                sector_id INTEGER REFERENCES sectors(id)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO ships_multi (id, player_id, ship_type, holds_total,
+                fighters, shields, mines, probes, fuel_ore, organics,
+                equipment, station_core, sector_id)
+            SELECT id, player_id, ship_type, holds_total,
+                fighters, shields, mines, probes, fuel_ore, organics,
+                equipment, station_core, NULL
+            FROM ships
+        """)
+        conn.execute("DROP TABLE ships")
+        conn.execute("ALTER TABLE ships_multi RENAME TO ships")
+        conn.execute("PRAGMA foreign_keys = ON")
+
+    # Which of a player's ships they're flying. Backfilled from the 1:1
+    # rows for databases that predate multi-ship ownership (each player
+    # had exactly one ship, so MIN(id) is it).
+    try:
+        conn.execute(
+            "ALTER TABLE players ADD COLUMN active_ship_id INTEGER REFERENCES ships(id)"
+        )
+    except sqlite3.OperationalError:
+        pass  # already has the column
+    conn.execute("""
+        UPDATE players
+        SET active_ship_id = (SELECT MIN(id) FROM ships WHERE ships.player_id = players.id)
+        WHERE active_ship_id IS NULL
+    """)
+
+    # The parked ship a player is currently dragging behind them, if any
+    # (NULL otherwise). Lives on the player so a tow survives session
+    # timeouts; every hull swap/board/deletion clears it.
+    try:
+        conn.execute(
+            "ALTER TABLE players ADD COLUMN towing_ship_id INTEGER REFERENCES ships(id)"
+        )
     except sqlite3.OperationalError:
         pass  # already has the column
 
@@ -603,7 +677,7 @@ def execute_trade(player_id, port_id, commodity, qty, total_price, player_is_buy
         (credit_delta, player_id)
     )
     conn.execute(
-        f"UPDATE ships SET {commodity} = {commodity} + ? WHERE player_id = ?",
+        f"UPDATE ships SET {commodity} = {commodity} + ? WHERE id = (SELECT active_ship_id FROM players WHERE id = ?)",
         (cargo_delta, player_id)
     )
     conn.execute(
@@ -715,7 +789,7 @@ def upgrade_ship_stat(player_id, stat_column, qty, total_price):
         (total_price, player_id)
     )
     conn.execute(
-        f"UPDATE ships SET {stat_column} = {stat_column} + ? WHERE player_id = ?",
+        f"UPDATE ships SET {stat_column} = {stat_column} + ? WHERE id = (SELECT active_ship_id FROM players WHERE id = ?)",
         (qty, player_id)
     )
     conn.commit()
@@ -730,24 +804,181 @@ def buy_ship(player_id, ship_type, holds_total, fighters, shields, mines, credit
     and a positive credit_delta for that case):
       - player's credits change by credit_delta (negative for a net
         purchase cost, positive for a net refund)
-      - the ship's type and holds_total/fighters/shields/mines are
-        replaced with the new hull's values
+      - the ACTIVE ship's type and holds_total/fighters/shields/mines are
+        replaced with the new hull's values (parked ships are untouched)
       - any cargo being carried is cleared -- a hull swap empties the
         hold, since the old ship's cargo doesn't transfer to the new one
+      - any tow in progress is released (the old hull -- and whatever
+        rigging held the tow line -- is gone)
     Caller is responsible for validating affordability beforehand --
     this function does not re-check anything.
     """
     conn = get_connection()
     conn.execute(
-        "UPDATE players SET credits = credits + ? WHERE id = ?",
+        "UPDATE players SET credits = credits + ?, towing_ship_id = NULL WHERE id = ?",
         (credit_delta, player_id)
     )
     conn.execute(
         """UPDATE ships
            SET ship_type = ?, holds_total = ?, fighters = ?, shields = ?, mines = ?,
                probes = 0, fuel_ore = 0, organics = 0, equipment = 0, station_core = 0
-           WHERE player_id = ?""",
+           WHERE id = (SELECT active_ship_id FROM players WHERE id = ?)""",
         (ship_type, holds_total, fighters, shields, mines, player_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def park_and_buy_ship(player_id, park_sector_id, ship_type, holds_total,
+                      fighters, shields, mines, credit_delta):
+    """
+    Buy a new hull while KEEPING the current one: in a single
+    transaction, the active ship is parked in `park_sector_id` (with
+    everything still aboard -- cargo, fighters, shields, mines, probes,
+    even a carried Station Core kit), a fresh ship of `ship_type` is
+    created and made active, credits change by credit_delta (negative:
+    the full purchase price, no trade-in), and any tow is released.
+    Returns the new ship's id. Caller validates affordability.
+    """
+    conn = get_connection()
+    conn.execute(
+        """UPDATE ships SET sector_id = ?
+           WHERE id = (SELECT active_ship_id FROM players WHERE id = ?)""",
+        (park_sector_id, player_id)
+    )
+    cur = conn.execute(
+        """INSERT INTO ships (player_id, ship_type, holds_total, fighters, shields,
+                              mines, probes, fuel_ore, organics, equipment,
+                              station_core, sector_id)
+           VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, NULL)""",
+        (player_id, ship_type, holds_total, fighters, shields, mines)
+    )
+    new_ship_id = cur.lastrowid
+    conn.execute(
+        """UPDATE players
+           SET active_ship_id = ?, towing_ship_id = NULL, credits = credits + ?
+           WHERE id = ?""",
+        (new_ship_id, credit_delta, player_id)
+    )
+    conn.commit()
+    conn.close()
+    return new_ship_id
+
+
+def swap_active_ship(player_id, ship_id, park_sector_id):
+    """
+    Board one of the player's own parked ships (`ship_id`), in a single
+    transaction: the current active ship is parked in `park_sector_id`
+    -- unless it's an Escape Pod, which is scuttled (deleted) instead,
+    since a pod isn't a hull worth keeping -- the target ship becomes
+    active (sector_id back to NULL), and any tow is released. Caller
+    validates ownership and that the ship is parked in the player's
+    sector; this does not re-check.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT ships.id, ships.ship_type FROM ships
+           JOIN players ON players.active_ship_id = ships.id
+           WHERE players.id = ?""",
+        (player_id,)
+    ).fetchone()
+    # Repoint the player at the new hull FIRST -- active_ship_id
+    # references ships(id), so a pod can't be deleted while it's still
+    # the row the player points at.
+    conn.execute("UPDATE ships SET sector_id = NULL WHERE id = ?", (ship_id,))
+    conn.execute(
+        "UPDATE players SET active_ship_id = ?, towing_ship_id = NULL WHERE id = ?",
+        (ship_id, player_id)
+    )
+    if row["ship_type"] == ESCAPE_POD_SHIP:
+        conn.execute("DELETE FROM ships WHERE id = ?", (row["id"],))
+    else:
+        conn.execute(
+            "UPDATE ships SET sector_id = ? WHERE id = ?",
+            (park_sector_id, row["id"])
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_ship(ship_id):
+    """A single ship row (parked or active) as a dict, joined with its
+    owner's name as owner_name (player_id doubles as owner_id). None if
+    no such ship."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT ships.*, ships.player_id AS owner_id, players.name AS owner_name
+           FROM ships JOIN players ON players.id = ships.player_id
+           WHERE ships.id = ?""",
+        (ship_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_parked_ships_in_sector(sector_id):
+    """Every UNMANNED ship sitting in `sector_id` (including one being
+    towed by a player standing there -- it follows its tower's sector),
+    in stable id order, each with owner_id/owner_name and enough combat
+    stats to size up or resolve an attack. Active ships never appear
+    here (their sector_id is NULL)."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT ships.id, ships.player_id AS owner_id, players.name AS owner_name,
+                  ships.ship_type, ships.fighters, ships.shields
+           FROM ships JOIN players ON players.id = ships.player_id
+           WHERE ships.sector_id = ?
+           ORDER BY ships.id""",
+        (sector_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def set_parked_ship_defenses(ship_id, shields, fighters):
+    """Write back a PARKED ship's shields/fighters after it soaked an
+    attack it survived (the parked-ship counterpart of
+    set_ship_defenses, which targets a player's active ship)."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE ships SET shields = ?, fighters = ? WHERE id = ?",
+        (shields, fighters, ship_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def move_ship_to_sector(ship_id, sector_id):
+    """Relocate a parked/towed ship. Used by towing: each move the tower
+    makes drags the towed hull's sector_id along."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE ships SET sector_id = ? WHERE id = ?", (sector_id, ship_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_ship(ship_id):
+    """Remove a ship outright (destroyed unmanned, or sold while parked
+    at the Stardock). Any player towing it lets go -- their
+    towing_ship_id is cleared so no dangling reference survives."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE players SET towing_ship_id = NULL WHERE towing_ship_id = ?",
+        (ship_id,)
+    )
+    conn.execute("DELETE FROM ships WHERE id = ?", (ship_id,))
+    conn.commit()
+    conn.close()
+
+
+def set_towing(player_id, ship_id):
+    """Engage (ship_id) or release (None) a player's tow."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE players SET towing_ship_id = ? WHERE id = ?",
+        (ship_id, player_id)
     )
     conn.commit()
     conn.close()
@@ -776,7 +1007,7 @@ def lay_mines(player_id, sector_id, qty):
     """
     conn = get_connection()
     conn.execute(
-        "UPDATE ships SET mines = mines - ? WHERE player_id = ?",
+        "UPDATE ships SET mines = mines - ? WHERE id = (SELECT active_ship_id FROM players WHERE id = ?)",
         (qty, player_id)
     )
     conn.execute(
@@ -824,7 +1055,7 @@ def consume_probe(player_id):
     validates there's at least one aboard beforehand."""
     conn = get_connection()
     conn.execute(
-        "UPDATE ships SET probes = probes - 1 WHERE player_id = ?",
+        "UPDATE ships SET probes = probes - 1 WHERE id = (SELECT active_ship_id FROM players WHERE id = ?)",
         (player_id,)
     )
     conn.commit()
@@ -867,7 +1098,7 @@ def set_ship_defenses(player_id, shields, fighters):
     hull for an Escape Pod.)"""
     conn = get_connection()
     conn.execute(
-        "UPDATE ships SET shields = ?, fighters = ? WHERE player_id = ?",
+        "UPDATE ships SET shields = ?, fighters = ? WHERE id = (SELECT active_ship_id FROM players WHERE id = ?)",
         (shields, fighters, player_id)
     )
     conn.commit()
@@ -879,7 +1110,7 @@ def set_ship_cargo(player_id, fuel_ore, organics, equipment):
     offloading materials into a station's stockpile."""
     conn = get_connection()
     conn.execute(
-        "UPDATE ships SET fuel_ore = ?, organics = ?, equipment = ? WHERE player_id = ?",
+        "UPDATE ships SET fuel_ore = ?, organics = ?, equipment = ? WHERE id = (SELECT active_ship_id FROM players WHERE id = ?)",
         (fuel_ore, organics, equipment, player_id)
     )
     conn.commit()
@@ -910,7 +1141,7 @@ def get_player_with_ship(pubkey_prefix):
                ships.fuel_ore, ships.organics, ships.equipment,
                ships.station_core
         FROM players
-        JOIN ships ON ships.player_id = players.id
+        JOIN ships ON ships.id = players.active_ship_id
         WHERE players.pubkey_prefix = ?
     """, (pubkey_prefix,)).fetchone()
     conn.close()
@@ -933,7 +1164,7 @@ def get_players_in_sector(sector_id, exclude_player_id=None):
     sql = """
         SELECT players.name, ships.fighters
         FROM players
-        JOIN ships ON ships.player_id = players.id
+        JOIN ships ON ships.id = players.active_ship_id
         WHERE players.sector_id = ?
     """
     params = [sector_id]
@@ -955,7 +1186,7 @@ def get_ships_in_sector(sector_id, exclude_player_id=None):
         SELECT players.id, players.name, players.credits,
                ships.ship_type, ships.fighters, ships.shields
         FROM players
-        JOIN ships ON ships.player_id = players.id
+        JOIN ships ON ships.id = players.active_ship_id
         WHERE players.sector_id = ?
     """
     params = [sector_id]
@@ -1074,7 +1305,7 @@ def set_ship_station_core(player_id, has_core):
     """Set (or clear) the undeployed Station Core kit flag on a ship."""
     conn = get_connection()
     conn.execute(
-        "UPDATE ships SET station_core = ? WHERE player_id = ?",
+        "UPDATE ships SET station_core = ? WHERE id = (SELECT active_ship_id FROM players WHERE id = ?)",
         (1 if has_core else 0, player_id)
     )
     conn.commit()
@@ -1256,11 +1487,15 @@ def create_player(pubkey_prefix, name):
     )
     player_id = cur.lastrowid
 
-    conn.execute(
+    cur = conn.execute(
         """INSERT INTO ships (player_id, ship_type, holds_total, fighters, shields, mines, fuel_ore, organics, equipment)
            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)""",
         (player_id, STARTER_SHIP["ship_type"], STARTER_SHIP["holds_total"],
          STARTER_SHIP["fighters"], STARTER_SHIP["shields"], STARTER_SHIP["mines"])
+    )
+    ship_id = cur.lastrowid
+    conn.execute(
+        "UPDATE players SET active_ship_id = ? WHERE id = ?", (ship_id, player_id)
     )
 
     conn.commit()
@@ -1297,6 +1532,19 @@ def reset_turns_if_needed(player_id):
         )
         conn.commit()
 
+    conn.close()
+
+
+def spend_turns(player_id, n):
+    """Charge `n` turns at once (towing costs several per sector),
+    clamped so the balance never drops below zero."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE players SET turns_remaining = MAX(0, turns_remaining - ?) "
+        "WHERE id = ?",
+        (n, player_id)
+    )
+    conn.commit()
     conn.close()
 
 

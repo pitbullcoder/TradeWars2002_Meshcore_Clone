@@ -52,6 +52,26 @@ PENDING_STATIONS = {}
 PENDING_P2P = {}
 
 
+# pubkey -> dict {"queue": [ship dicts], "idx": int} cycling yes/no through
+# the player's own parked ships in the sector for a tow. Populated by
+# cmd_tow, consumed by cmd_tow_step.
+PENDING_TOWS = {}
+
+
+# pubkey -> dict {"queue": [ship dicts], "idx": int} cycling yes/no through
+# the player's own parked ships in the sector for a board/swap. Populated
+# by cmd_board, consumed by cmd_board_step.
+PENDING_BOARDS = {}
+
+
+def ship_label(ship):
+    """The display name for an unmanned hull: owner + type + ship id,
+    e.g. "Joe's Kestrel #12". The #id is what disambiguates two parked
+    ships of the same type (and what 'a #12' / 'tow #12' / 'board #12'
+    target directly)."""
+    return f"{ship['owner_name']}'s {ship['ship_type']} #{ship['id']}"
+
+
 # Map of command -> (description, async handler(ctx, args) -> str)
 COMMANDS = {}
 

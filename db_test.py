@@ -293,6 +293,235 @@ class StationDbTests(unittest.TestCase):
         self.assertIsNone(db.get_station_in_sector(20))
 
 
+class MultiShipMigrationTests(unittest.TestCase):
+    """init_db against a database from the one-ship era: the UNIQUE
+    constraint on ships.player_id must be rebuilt away, sector_id added,
+    and players.active_ship_id backfilled from the old 1:1 rows."""
+
+    def setUp(self):
+        db.DB_PATH = os.path.join(tempfile.mkdtemp(), "legacy.db")
+        # Build the OLD schema by hand -- players without
+        # active_ship_id/towing_ship_id, ships with UNIQUE(player_id) and
+        # no sector_id -- with a player and their single ship in it.
+        import sqlite3
+        conn = sqlite3.connect(db.DB_PATH)
+        conn.execute("CREATE TABLE sectors (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO sectors (id) VALUES (1)")
+        conn.execute("""
+            CREATE TABLE players (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pubkey_prefix TEXT NOT NULL UNIQUE,
+                name TEXT,
+                sector_id INTEGER NOT NULL REFERENCES sectors(id),
+                credits INTEGER NOT NULL DEFAULT 0,
+                turns_remaining INTEGER NOT NULL DEFAULT 0,
+                last_turn_reset TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_kill_log_seen TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE ships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_id INTEGER NOT NULL UNIQUE REFERENCES players(id),
+                ship_type TEXT NOT NULL,
+                holds_total INTEGER NOT NULL,
+                fighters INTEGER NOT NULL DEFAULT 0,
+                shields INTEGER NOT NULL DEFAULT 0,
+                mines INTEGER NOT NULL DEFAULT 0,
+                probes INTEGER NOT NULL DEFAULT 0,
+                fuel_ore INTEGER NOT NULL DEFAULT 0,
+                organics INTEGER NOT NULL DEFAULT 0,
+                equipment INTEGER NOT NULL DEFAULT 0,
+                station_core INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute(
+            "INSERT INTO players (pubkey_prefix, name, sector_id, credits, "
+            "turns_remaining, last_turn_reset, created_at) "
+            "VALUES ('pk', 'Alice', 1, 500, 10, '2026-01-01', '2026-01-01')"
+        )
+        conn.execute(
+            "INSERT INTO ships (player_id, ship_type, holds_total, fighters, "
+            "shields, mines, fuel_ore) VALUES (1, 'Kestrel', 15, 20, 20, 0, 7)"
+        )
+        conn.commit()
+        conn.close()
+
+        db.init_db()  # the migration under test
+
+    def test_unique_constraint_is_gone_and_sector_id_added(self):
+        conn = db.get_connection()
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='ships'"
+        ).fetchone()["sql"]
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(ships)")}
+        conn.close()
+        self.assertNotIn("UNIQUE", sql.upper())
+        self.assertIn("sector_id", columns)
+
+    def test_ship_data_survives_and_active_ship_is_backfilled(self):
+        p = db.get_player_with_ship("pk")
+        self.assertEqual(p["ship_type"], "Kestrel")
+        self.assertEqual(p["fuel_ore"], 7)          # row copied intact
+        self.assertEqual(p["active_ship_id"], p["ship_id"])
+        self.assertIsNone(p["towing_ship_id"])
+
+    def test_second_ship_for_the_same_player_is_now_allowed(self):
+        new_id = db.park_and_buy_ship(1, 1, "Mule", 40, 0, 30, 0, -40000)
+        conn = db.get_connection()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM ships WHERE player_id = 1"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 2)
+        self.assertEqual(db.get_player_with_ship("pk")["ship_id"], new_id)
+
+    def test_migration_is_idempotent(self):
+        db.init_db()  # a second run must not duplicate or fail
+        conn = db.get_connection()
+        count = conn.execute("SELECT COUNT(*) FROM ships").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)
+
+
+class MultiShipDbTests(unittest.TestCase):
+    """The multi-ship functions against a real db: parking on purchase,
+    boarding, towing bookkeeping, parked-ship queries, and turn bundles."""
+
+    def setUp(self):
+        db.DB_PATH = os.path.join(tempfile.mkdtemp(), "ships.db")
+        db.init_db()
+        conn = db.get_connection()
+        conn.executemany(
+            "INSERT INTO sectors (id) VALUES (?)", [(i,) for i in range(1, 21)]
+        )
+        conn.commit()
+        conn.close()
+        self.player = db.create_player("pk", "Alice")
+
+    def _fresh(self):
+        return db.get_player_with_ship("pk")
+
+    def test_create_player_sets_the_active_ship(self):
+        p = self._fresh()
+        self.assertIsNotNone(p["active_ship_id"])
+        self.assertEqual(p["active_ship_id"], p["ship_id"])
+
+    def test_park_and_buy_keeps_the_old_hull_with_everything_aboard(self):
+        db.set_ship_cargo(self.player["id"], 5, 0, 2)   # load the Falcon
+        old_ship_id = self._fresh()["ship_id"]
+
+        new_id = db.park_and_buy_ship(
+            self.player["id"], 1, "Kestrel", 15, 20, 20, 0, credit_delta=-8000
+        )
+
+        p = self._fresh()
+        self.assertEqual(p["ship_id"], new_id)
+        self.assertEqual(p["ship_type"], "Kestrel")
+        self.assertEqual(p["fuel_ore"], 0)              # new hull starts empty
+        self.assertEqual(p["credits"], self.player["credits"] - 8000)
+        old = db.get_ship(old_ship_id)
+        self.assertEqual(old["sector_id"], 1)           # parked right here
+        self.assertEqual(old["fuel_ore"], 5)            # cargo stays aboard
+        self.assertEqual(old["equipment"], 2)
+        self.assertEqual(old["owner_name"], "Alice")
+
+    def test_parked_ships_query_and_ship_writes_target_only_the_active_hull(self):
+        old_ship_id = self._fresh()["ship_id"]
+        db.park_and_buy_ship(self.player["id"], 1, "Kestrel", 15, 20, 20, 0, 0)
+
+        parked = db.get_parked_ships_in_sector(1)
+        self.assertEqual([s["id"] for s in parked], [old_ship_id])
+        self.assertEqual(parked[0]["owner_id"], self.player["id"])
+
+        # A defensive write goes to the ACTIVE Kestrel, not the parked Falcon.
+        db.set_ship_defenses(self.player["id"], 99, 88)
+        self.assertEqual(self._fresh()["shields"], 99)
+        old = db.get_ship(old_ship_id)
+        self.assertEqual(old["shields"], 10)            # Falcon untouched
+
+        # And the parked-ship counterpart goes to the parked hull only.
+        db.set_parked_ship_defenses(old_ship_id, 3, 4)
+        self.assertEqual(db.get_ship(old_ship_id)["shields"], 3)
+        self.assertEqual(self._fresh()["shields"], 99)
+
+    def test_swap_active_ship_parks_current_and_boards_target(self):
+        old_ship_id = self._fresh()["ship_id"]
+        new_id = db.park_and_buy_ship(
+            self.player["id"], 1, "Kestrel", 15, 20, 20, 0, 0
+        )
+        db.set_towing(self.player["id"], old_ship_id)
+
+        # Board the parked Falcon from the Kestrel, over in Sec5.
+        db.swap_active_ship(self.player["id"], old_ship_id, 5)
+
+        p = self._fresh()
+        self.assertEqual(p["ship_id"], old_ship_id)
+        self.assertEqual(p["ship_type"], "Falcon")
+        self.assertIsNone(p["towing_ship_id"])          # boarding drops the tow
+        kestrel = db.get_ship(new_id)
+        self.assertEqual(kestrel["sector_id"], 5)       # parked where we stood
+
+    def test_swapping_out_of_an_escape_pod_scuttles_it(self):
+        old_ship_id = self._fresh()["ship_id"]
+        db.park_and_buy_ship(self.player["id"], 1, "Kestrel", 15, 20, 20, 0, 0)
+        pod_id = self._fresh()["ship_id"]
+        # The active Kestrel is destroyed: buy_ship swaps it to a pod in place.
+        db.buy_ship(self.player["id"], "Escape Pod", 0, 0, 0, 0, 0)
+
+        db.swap_active_ship(self.player["id"], old_ship_id, 1)
+
+        self.assertEqual(self._fresh()["ship_type"], "Falcon")
+        self.assertIsNone(db.get_ship(pod_id))          # pod row deleted
+
+    def test_delete_ship_clears_any_tow_reference(self):
+        old_ship_id = self._fresh()["ship_id"]
+        db.park_and_buy_ship(self.player["id"], 1, "Kestrel", 15, 20, 20, 0, 0)
+        db.set_towing(self.player["id"], old_ship_id)
+
+        db.delete_ship(old_ship_id)
+
+        self.assertIsNone(db.get_ship(old_ship_id))
+        self.assertIsNone(self._fresh()["towing_ship_id"])
+
+    def test_buy_ship_replaces_only_the_active_hull_and_releases_the_tow(self):
+        old_ship_id = self._fresh()["ship_id"]
+        db.park_and_buy_ship(self.player["id"], 1, "Kestrel", 15, 20, 20, 0, 0)
+        db.set_towing(self.player["id"], old_ship_id)
+
+        db.buy_ship(self.player["id"], "Mule", 40, 0, 30, 0, credit_delta=-40000)
+
+        p = self._fresh()
+        self.assertEqual(p["ship_type"], "Mule")
+        self.assertIsNone(p["towing_ship_id"])
+        old = db.get_ship(old_ship_id)
+        self.assertEqual(old["ship_type"], "Falcon")    # parked hull untouched
+
+    def test_move_ship_to_sector_relocates_a_parked_hull(self):
+        old_ship_id = self._fresh()["ship_id"]
+        db.park_and_buy_ship(self.player["id"], 1, "Kestrel", 15, 20, 20, 0, 0)
+
+        db.move_ship_to_sector(old_ship_id, 7)
+
+        self.assertEqual(db.get_ship(old_ship_id)["sector_id"], 7)
+        self.assertEqual([s["id"] for s in db.get_parked_ships_in_sector(7)],
+                         [old_ship_id])
+        self.assertEqual(db.get_parked_ships_in_sector(1), [])
+
+    def test_spend_turns_charges_in_bulk_and_clamps_at_zero(self):
+        conn = db.get_connection()
+        conn.execute("UPDATE players SET turns_remaining = 7 WHERE id = ?",
+                     (self.player["id"],))
+        conn.commit()
+        conn.close()
+
+        db.spend_turns(self.player["id"], 5)
+        self.assertEqual(self._fresh()["turns_remaining"], 2)
+        db.spend_turns(self.player["id"], 5)
+        self.assertEqual(self._fresh()["turns_remaining"], 0)   # clamped
+
+
 class PortRestockTests(unittest.TestCase):
     """apply_port_restock against a real db: proportional drift of stock
     toward each commodity's starting level (selling up to capacity, buying

@@ -82,7 +82,29 @@ STATE = {
     # and enter_sector show/run no station logic unless a test sets one.
     "stations": {},
     "next_station_id": 1,
+    # Multi-ship fixtures: unmanned (parked/towed) hulls, keyed by ship id.
+    # Each is a dict shaped like db.get_parked_ships_in_sector's rows
+    # (id, owner_id, owner_name, ship_type, fighters, shields, sector_id),
+    # plus any full-ship stats a board/swap test needs. The *_log lists
+    # record mutations the way ship_log/defense_log do. next_ship_id feeds
+    # _stub_park_and_buy_ship. Reset by _reset_multiship_state() in every
+    # suite's setUp.
+    "parked_ships": {},
+    "parked_defense_log": [],
+    "ship_move_log": [],
+    "ship_delete_log": [],
+    "park_buy_log": [],
+    "next_ship_id": 100,
 }
+
+
+def _reset_multiship_state():
+    STATE["parked_ships"] = {}
+    STATE["parked_defense_log"] = []
+    STATE["ship_move_log"] = []
+    STATE["ship_delete_log"] = []
+    STATE["park_buy_log"] = []
+    STATE["next_ship_id"] = 100
 
 
 def _stub_get_port(sector_id):
@@ -295,6 +317,109 @@ def _stub_set_ship_defenses(player_id, shields, fighters):
         pl["fighters"] = fighters
 
 
+# --- Multi-ship stubs ---------------------------------------------------
+# Parked/towed hulls live in STATE["parked_ships"]; the active ship's
+# stats stay flattened onto the player dict, exactly as the real
+# get_player_with_ship join presents them.
+
+_SHIP_STAT_KEYS = ("ship_type", "holds_total", "fighters", "shields", "mines",
+                   "probes", "fuel_ore", "organics", "equipment", "station_core")
+
+
+def _stub_get_parked_ships_in_sector(sector_id):
+    # Stable id order, mirroring the real query's ORDER BY ships.id.
+    return sorted(
+        (dict(s) for s in STATE["parked_ships"].values()
+         if s.get("sector_id") == sector_id),
+        key=lambda s: s["id"],
+    )
+
+
+def _stub_get_ship(ship_id):
+    s = STATE["parked_ships"].get(ship_id)
+    return dict(s) if s else None
+
+
+def _stub_set_parked_ship_defenses(ship_id, shields, fighters):
+    STATE["parked_defense_log"].append((ship_id, shields, fighters))
+    s = STATE["parked_ships"].get(ship_id)
+    if s is not None:
+        s["shields"] = shields
+        s["fighters"] = fighters
+
+
+def _stub_move_ship_to_sector(ship_id, sector_id):
+    STATE["ship_move_log"].append((ship_id, sector_id))
+    s = STATE["parked_ships"].get(ship_id)
+    if s is not None:
+        s["sector_id"] = sector_id
+
+
+def _stub_delete_ship(ship_id):
+    STATE["ship_delete_log"].append(ship_id)
+    STATE["parked_ships"].pop(ship_id, None)
+    # Mirror the real delete_ship: anyone towing the deleted hull lets go.
+    for pl in [STATE["player"], *STATE["players_by_id"].values()]:
+        if pl.get("towing_ship_id") == ship_id:
+            pl["towing_ship_id"] = None
+
+
+def _stub_set_towing(player_id, ship_id):
+    pl = _player_by_id(player_id)
+    if pl is not None:
+        pl["towing_ship_id"] = ship_id
+
+
+def _stub_spend_turns(player_id, n):
+    pl = _player_by_id(player_id)
+    if pl is not None:
+        pl["turns_remaining"] = max(0, pl.get("turns_remaining", 0) - n)
+
+
+def _stub_swap_active_ship(player_id, ship_id, park_sector_id):
+    pl = _player_by_id(player_id)
+    target = STATE["parked_ships"].pop(ship_id)
+    if pl["ship_type"] != ESCAPE_POD_SHIP:
+        old = {"id": pl.get("ship_id"), "owner_id": pl["id"],
+               "owner_name": pl["name"], "sector_id": park_sector_id}
+        for k in _SHIP_STAT_KEYS:
+            old[k] = pl.get(k, 0)
+        STATE["parked_ships"][old["id"]] = old
+    for k in _SHIP_STAT_KEYS:
+        pl[k] = target.get(k, 0)
+    pl["ship_id"] = ship_id
+    pl["towing_ship_id"] = None
+
+
+def _stub_park_and_buy_ship(player_id, park_sector_id, ship_type, holds_total,
+                            fighters, shields, mines, credit_delta):
+    STATE["park_buy_log"].append(
+        (ship_type, holds_total, fighters, shields, mines, credit_delta, park_sector_id)
+    )
+    pl = _player_by_id(player_id)
+    old = {"id": pl.get("ship_id"), "owner_id": pl["id"],
+           "owner_name": pl["name"], "sector_id": park_sector_id}
+    for k in _SHIP_STAT_KEYS:
+        old[k] = pl.get(k, 0)
+    STATE["parked_ships"][old["id"]] = old
+    new_id = STATE["next_ship_id"]
+    STATE["next_ship_id"] += 1
+    pl["ship_type"] = ship_type
+    pl["holds_total"] = holds_total
+    pl["fighters"] = fighters
+    pl["shields"] = shields
+    pl["mines"] = mines
+    pl["probes"] = 0
+    pl["fuel_ore"] = 0
+    pl["organics"] = 0
+    pl["equipment"] = 0
+    pl["station_core"] = 0
+    pl["ship_id"] = new_id
+    pl["towing_ship_id"] = None
+    pl["credits"] += credit_delta
+    return new_id
+
+
 # Mirrors db.SHIP_CATALOG -- kept as a separate copy here (rather than
 # importing the real db module) since this whole file exists to test
 # main.py without a real db module loaded at all.
@@ -493,6 +618,7 @@ def _stub_buy_ship(player_id, ship_type, holds_total, fighters, shields, mines, 
     player["organics"] = 0
     player["equipment"] = 0
     player["credits"] += credit_delta
+    player["towing_ship_id"] = None  # a hull swap releases any tow
 
 
 # --- Space-station stubs ----------------------------------------------
@@ -627,6 +753,15 @@ def _install_stub_modules():
     db_stub.consume_probe = _stub_consume_probe
     db_stub.detonate_one_hostile_mine = _stub_detonate_one_hostile_mine
     db_stub.set_ship_defenses = _stub_set_ship_defenses
+    db_stub.get_parked_ships_in_sector = _stub_get_parked_ships_in_sector
+    db_stub.get_ship = _stub_get_ship
+    db_stub.set_parked_ship_defenses = _stub_set_parked_ship_defenses
+    db_stub.move_ship_to_sector = _stub_move_ship_to_sector
+    db_stub.delete_ship = _stub_delete_ship
+    db_stub.set_towing = _stub_set_towing
+    db_stub.spend_turns = _stub_spend_turns
+    db_stub.swap_active_ship = _stub_swap_active_ship
+    db_stub.park_and_buy_ship = _stub_park_and_buy_ship
     db_stub.sell_value = _stub_sell_value
     db_stub.SHIP_CATALOG = SHIP_CATALOG
     db_stub.DEFAULT_SHIP_TYPE = DEFAULT_SHIP_TYPE
@@ -705,6 +840,8 @@ def fresh_player(**overrides):
         "organics": 0,
         "equipment": 0,
         "station_core": 0,
+        "ship_id": 50,          # the active ship's row id
+        "towing_ship_id": None,
     }
     base.update(overrides)
     return base
@@ -732,6 +869,7 @@ class PortTradeFlowTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
         STATE["ship_log"] = []
@@ -887,6 +1025,7 @@ class StardockRefitFlowTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
         STATE["ship_log"] = []
@@ -1101,6 +1240,7 @@ class NavigationDockingFlowTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
         STATE["ship_log"] = []
@@ -1274,6 +1414,7 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
         STATE["ship_log"] = []
@@ -1335,6 +1476,14 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.enter_shipyard()
         prompt = await self.say("9")  # Bismark
         self.assertIn(
+            "Buying a Bismark (500000cr). Sell your Falcon as trade-in (+0cr, net "
+            "500000cr), or keep it parked here in Sec1 (full 500000cr)? "
+            "Reply sell/keep (or cancel).",
+            prompt,
+        )
+
+        prompt = await self.say("sell")
+        self.assertIn(
             "Trade in your Falcon (0cr) for a Bismark (500000cr)? Net cost: 500000cr. yes/no",
             prompt,
         )
@@ -1364,7 +1513,8 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
         STATE["port"] = fresh_port("STARDOCK")
 
         await self.enter_shipyard()
-        prompt = await self.say("6")  # SS Endeavour
+        await self.say("6")  # SS Endeavour -> the sell-or-keep question
+        prompt = await self.say("sell")
         self.assertIn(
             "Trade in your Falcon (0cr) for a SS Endeavour (200000cr)? Net cost: 200000cr. yes/no",
             prompt,
@@ -1418,6 +1568,7 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
 
         await self.enter_shipyard()
         await self.say("6")     # SS Endeavour
+        await self.say("sell")  # trade the Falcon in
         await self.say("yes")
 
         final = STATE["player"]
@@ -1467,6 +1618,7 @@ class ShipyardFlowTests(unittest.IsolatedAsyncioTestCase):
 
         await self.enter_shipyard()
         await self.say("6")
+        await self.say("sell")
         prompt = await self.say("no")
 
         self.assertIn("Shipyard:", prompt)
@@ -1510,6 +1662,7 @@ class MinesRefitTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["trade_log"] = []
         STATE["upgrade_log"] = []
         STATE["ship_log"] = []
@@ -1697,6 +1850,7 @@ class LayMinesCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["mine_log"] = []
         STATE["defense_log"] = []
         STATE["sector_mines"] = {}
@@ -1771,6 +1925,7 @@ class JettisonCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
 
     def ctx(self):
         return FakeCtx(PUBKEY, dict(STATE["player"]))
@@ -1919,6 +2074,7 @@ class P2PCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["warps"] = {100: [101], 101: [100]}
         STATE["ports"] = {}
         STATE["sector_mines"] = {}
@@ -2319,6 +2475,7 @@ class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["ship_log"] = []
         STATE["mine_log"] = []
         STATE["defense_log"] = []
@@ -2470,6 +2627,7 @@ class CombatMenuTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["player"] = fresh_player()
 
     def ctx(self):
@@ -2515,6 +2673,7 @@ class ProbeRefitTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["upgrade_log"] = []
         STATE["port"] = {}
         STATE["ports"] = {}
@@ -2560,6 +2719,7 @@ class ProbeCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["probe_log"] = []
         STATE["sector_mines"] = {}
         STATE["ports"] = {}
@@ -2650,6 +2810,7 @@ class SectorPresenceTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["ports"] = {}
         STATE["port"] = {}
         STATE["warps"] = chain_warps(30)
@@ -2759,6 +2920,7 @@ class AttackCommandTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["defense_log"] = []
         STATE["ship_log"] = []
         STATE["move_log"] = []
@@ -2820,12 +2982,33 @@ class AttackCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No ship named 'Zara'", prompt)
         self.assertEqual(STATE["attack_events"], [])
 
-    async def test_must_name_target_when_several_present(self):
+    async def test_bare_attack_cycles_targets_one_at_a_time(self):
+        """Bare 'a' walks the targets with yes/no prompts: 'no' moves to
+        the next pilot, 'yes' locks on and asks for a fighter count."""
         STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
         STATE["players_by_id"] = {2: self._defender(id=2, name="Bob"),
                                   3: self._defender(id=3, name="Cleo")}
+
         prompt = await main.cmd_attack(self.ctx(), "")
-        self.assertIn("Attack who?", prompt)
+        self.assertIn("Attack Bob (1000 ftr)? yes/no", prompt)
+
+        prompt = await main.cmd_attack_step(self.ctx(), "no")
+        self.assertIn("Attack Cleo (1000 ftr)? yes/no", prompt)
+
+        prompt = await main.cmd_attack_step(self.ctx(), "yes")
+        self.assertIn("Attack Cleo with how many fighters", prompt)
+        self.assertEqual(STATE["defense_log"], [])   # still nothing fired
+
+    async def test_bare_attack_declining_every_target_calls_it_off(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
+        STATE["players_by_id"] = {2: self._defender(id=2, name="Bob")}
+
+        await main.cmd_attack(self.ctx(), "")
+        prompt = await main.cmd_attack_step(self.ctx(), "no")
+
+        self.assertIn("no more targets", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_ATTACKS)
+        self.assertEqual(STATE["defense_log"], [])
 
     async def test_aiming_prompts_for_a_fighter_count_without_firing(self):
         STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
@@ -2972,6 +3155,7 @@ class AttackNoticeTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["attack_events"] = []
         STATE["kills"] = []
         STATE["kill_log_cutoff"] = {}
@@ -3037,6 +3221,7 @@ class KillLogTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["attack_events"] = []
         STATE["kills"] = []
         STATE["kill_log_cutoff"] = {}
@@ -3156,6 +3341,7 @@ class TurnCostTests(unittest.IsolatedAsyncioTestCase):
 
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["warps"] = chain_warps(30)
         STATE["sector_mines"] = {}
         STATE["ports"] = {}
@@ -3213,6 +3399,7 @@ class StationCommandTests(unittest.IsolatedAsyncioTestCase):
         import io
         with contextlib.redirect_stdout(io.StringIO()):
             importlib.reload(main)
+        _reset_multiship_state()
         STATE["stations"] = {}
         STATE["next_station_id"] = 1
         STATE["players_by_id"] = {}
@@ -3437,6 +3624,576 @@ class StationCommandTests(unittest.IsolatedAsyncioTestCase):
         prompt = await main.cmd_move(self.ctx(), "20")
         self.assertNotIn("opens fire", prompt)
         self.assertEqual(STATE["player"]["fighters"], 10)  # untouched
+
+
+def _parked(ship_id, owner_id, owner_name, sector_id, ship_type="Kestrel",
+            fighters=0, shields=0, **extra):
+    """A parked-ship fixture shaped like db.get_parked_ships_in_sector's
+    rows, with any full-ship stats a board test needs mixed in."""
+    ship = {
+        "id": ship_id, "owner_id": owner_id, "owner_name": owner_name,
+        "sector_id": sector_id, "ship_type": ship_type,
+        "fighters": fighters, "shields": shields,
+    }
+    ship.update(extra)
+    return ship
+
+
+class UnmannedSectorInfoTests(unittest.IsolatedAsyncioTestCase):
+    """The sector-info "Unmanned:" line for parked ships."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        _reset_multiship_state()
+        STATE["sector_players"] = {}
+        STATE["stations"] = {}
+        STATE["warps"] = {}
+        STATE["ports"] = {}
+        STATE["port"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def test_parked_ships_listed_with_owner_type_id_and_fighters(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15)
+        STATE["parked_ships"] = {
+            12: _parked(12, owner_id=2, owner_name="Bob", sector_id=15,
+                        ship_type="Kestrel", fighters=5),
+            7: _parked(7, owner_id=3, owner_name="Cleo", sector_id=15,
+                       ship_type="Mule", fighters=0),
+        }
+        info = await main.cmd_info(self.ctx(), "")
+        self.assertIn("Unmanned: Cleo's Mule #7 (0 ftr), Bob's Kestrel #12 (5 ftr)", info)
+
+    async def test_viewers_own_parked_ship_is_listed_too(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15)
+        STATE["parked_ships"] = {
+            12: _parked(12, owner_id=1, owner_name="Tester", sector_id=15),
+        }
+        info = await main.cmd_info(self.ctx(), "")
+        self.assertIn("Unmanned: Tester's Kestrel #12 (0 ftr)", info)
+
+    async def test_no_unmanned_line_when_sector_has_no_parked_ships(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15)
+        STATE["parked_ships"] = {
+            12: _parked(12, owner_id=2, owner_name="Bob", sector_id=16),  # elsewhere
+        }
+        info = await main.cmd_info(self.ctx(), "")
+        self.assertNotIn("Unmanned:", info)
+
+
+class AttackUnmannedShipTests(unittest.IsolatedAsyncioTestCase):
+    """Attacking parked (unmanned) ships: targeting by #id, the guided
+    cycle offering them after pilots, and resolution (same shield/fighter
+    math; a kill deletes the hull and notifies the owner)."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        _reset_multiship_state()
+        STATE["defense_log"] = []
+        STATE["attack_events"] = []
+        STATE["kills"] = []
+        STATE["players_by_id"] = {}
+        STATE["warps"] = chain_warps(30)
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def test_attack_parked_ship_by_id(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
+        STATE["parked_ships"] = {
+            12: _parked(12, owner_id=2, owner_name="Bob", sector_id=15,
+                        fighters=10, shields=20),
+        }
+        prompt = await main.cmd_attack(self.ctx(), "#12")
+        self.assertIn("Attack Bob's Kestrel #12 with how many fighters", prompt)
+        self.assertIn(PUBKEY, main.PENDING_ATTACKS)
+
+    async def test_cannot_attack_your_own_parked_ship(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15, fighters=500)
+        STATE["parked_ships"] = {
+            12: _parked(12, owner_id=1, owner_name="Tester", sector_id=15),
+        }
+        prompt = await main.cmd_attack(self.ctx(), "#12")
+        self.assertIn("your own ship", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_ATTACKS)
+
+    async def test_bare_attack_offers_unmanned_ship_after_pilots(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, fighters=500)
+        STATE["players_by_id"] = {
+            2: {"id": 2, "name": "Bob", "ship_type": "Bismark",
+                "fighters": 1000, "shields": 200, "sector_id": 15, "credits": 0},
+        }
+        STATE["parked_ships"] = {
+            12: _parked(12, owner_id=3, owner_name="Cleo", sector_id=15,
+                        fighters=5, shields=0),
+        }
+        prompt = await main.cmd_attack(self.ctx(), "")
+        self.assertIn("Attack Bob (1000 ftr)? yes/no", prompt)
+        prompt = await main.cmd_attack_step(self.ctx(), "no")
+        self.assertIn("Attack Cleo's Kestrel #12 (5 ftr)? yes/no", prompt)
+        prompt = await main.cmd_attack_step(self.ctx(), "yes")
+        self.assertIn("Attack Cleo's Kestrel #12 with how many fighters", prompt)
+
+    async def test_own_parked_ships_never_offered_in_the_cycle(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15, fighters=500)
+        STATE["parked_ships"] = {
+            12: _parked(12, owner_id=1, owner_name="Tester", sector_id=15),
+        }
+        prompt = await main.cmd_attack(self.ctx(), "")
+        self.assertIn("No other ships here to attack", prompt)
+
+    async def test_destroying_an_unmanned_ship_deletes_it_and_notifies_owner(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15, fighters=500)
+        STATE["parked_ships"] = {
+            12: _parked(12, owner_id=2, owner_name="Bob", sector_id=15,
+                        fighters=10, shields=20),
+        }
+        await main.cmd_attack(self.ctx(), "#12")
+        report = await main.cmd_attack_step(self.ctx(), "all")
+
+        # ceil(0.75*10)=8 to clear fighters, ceil(20/10)=2 for shields ->
+        # 10 engaged fighters spent, 490 survive.
+        self.assertIn("You destroyed the unmanned Bob's Kestrel #12!", report)
+        self.assertIn("You have 490 fighters", report)
+        self.assertNotIn(12, STATE["parked_ships"])          # hull is gone
+        self.assertEqual(STATE["ship_delete_log"], [12])
+        self.assertEqual(STATE["attack_events"][0]["victim_id"], 2)
+        self.assertEqual(STATE["attack_events"][0]["outcome"], "unmanned_destroyed")
+        self.assertEqual(STATE["kills"], [])                 # not in the public log
+
+    async def test_damaging_an_unmanned_ship_writes_back_its_defenses(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15, fighters=10)
+        STATE["parked_ships"] = {
+            12: _parked(12, owner_id=2, owner_name="Bob", sector_id=15,
+                        fighters=100, shields=50),
+        }
+        await main.cmd_attack(self.ctx(), "#12")
+        report = await main.cmd_attack_step(self.ctx(), "9")
+
+        # 9 attackers kill floor(9/0.75)=12 of 100 fighters, never reach
+        # shields: the hull survives at 88 fighters / 50 shields.
+        self.assertIn("You hit the unmanned Bob's Kestrel #12", report)
+        self.assertEqual(STATE["parked_ships"][12]["fighters"], 88)
+        self.assertEqual(STATE["parked_ships"][12]["shields"], 50)
+        self.assertEqual(STATE["attack_events"][0]["outcome"], "unmanned_attacked")
+        self.assertIn(12, STATE["parked_ships"])
+
+    async def test_unmanned_notices_read_correctly_at_sign_in(self):
+        events = [
+            {"attacker_name": "Tester", "sector_id": 15,
+             "outcome": "unmanned_destroyed", "created_at": "2026-06-27T12:00:00+00:00"},
+            {"attacker_name": "Tester", "sector_id": 15,
+             "outcome": "unmanned_attacked", "created_at": "2026-06-27T12:00:00+00:00"},
+        ]
+        text = main.format_attack_notices(events)
+        self.assertIn("Tester destroyed your unmanned ship in Sec15", text)
+        self.assertIn("Tester attacked your unmanned ship in Sec15", text)
+
+    async def test_parked_ships_in_the_safe_zone_are_protected(self):
+        STATE["player"] = fresh_player(id=1, sector_id=5, fighters=500)
+        STATE["parked_ships"] = {
+            12: _parked(12, owner_id=2, owner_name="Bob", sector_id=5),
+        }
+        prompt = await main.cmd_attack(self.ctx(), "#12")
+        self.assertIn("safe zone", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_ATTACKS)
+
+
+class TowCommandTests(unittest.IsolatedAsyncioTestCase):
+    """The tow command: engaging (guided and by #id), ownership checks,
+    the 5-turns-per-sector cost, refusals, and release."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        _reset_multiship_state()
+        STATE["sector_players"] = {}
+        STATE["players_by_id"] = {}
+        STATE["stations"] = {}
+        STATE["sector_mines"] = {}
+        STATE["ports"] = {}
+        STATE["port"] = {}
+        STATE["warps"] = chain_warps(30)
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    def _own_ship(self, ship_id=12, sector_id=15, **extra):
+        STATE["parked_ships"][ship_id] = _parked(
+            ship_id, owner_id=1, owner_name="Tester", sector_id=sector_id, **extra
+        )
+
+    async def test_engaging_a_tow_warns_about_the_turn_cost(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15,
+                                       turns_remaining=50)
+        self._own_ship(12)
+        prompt = await main.cmd_tow(self.ctx(), "#12")
+        self.assertIn("Tow line attached to Tester's Kestrel #12", prompt)
+        self.assertIn("WARNING: towing burns 5 turns per sector", prompt)
+        self.assertEqual(STATE["player"]["towing_ship_id"], 12)
+
+    async def test_cannot_tow_a_ship_you_do_not_own(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15)
+        STATE["parked_ships"][12] = _parked(12, owner_id=2, owner_name="Bob",
+                                            sector_id=15)
+        prompt = await main.cmd_tow(self.ctx(), "#12")
+        self.assertIn("isn't yours -- you can only tow your own ships", prompt)
+        self.assertIsNone(STATE["player"]["towing_ship_id"])
+
+    async def test_guided_tow_cycles_own_ships_and_engages_on_yes(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15)
+        self._own_ship(12, ship_type="Kestrel")
+        self._own_ship(13, ship_type="Mule")
+        # A stranger's hull parked here never enters the cycle.
+        STATE["parked_ships"][14] = _parked(14, owner_id=2, owner_name="Bob",
+                                            sector_id=15)
+
+        prompt = await main.cmd_tow(self.ctx(), "")
+        self.assertIn("Tow your Kestrel #12? yes/no", prompt)
+        prompt = await main.cmd_tow_step(self.ctx(), "no")
+        self.assertIn("Tow your Mule #13? yes/no", prompt)
+        prompt = await main.cmd_tow_step(self.ctx(), "yes")
+        self.assertIn("Tow line attached to Tester's Mule #13", prompt)
+        self.assertEqual(STATE["player"]["towing_ship_id"], 13)
+        self.assertNotIn(PUBKEY, main.PENDING_TOWS)
+
+    async def test_declining_every_ship_calls_the_tow_off(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15)
+        self._own_ship(12)
+        await main.cmd_tow(self.ctx(), "")
+        prompt = await main.cmd_tow_step(self.ctx(), "no")
+        self.assertIn("no more of your ships here", prompt)
+        self.assertIsNone(STATE["player"]["towing_ship_id"])
+        self.assertNotIn(PUBKEY, main.PENDING_TOWS)
+
+    async def test_an_escape_pod_cannot_tow(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, ship_type="Escape Pod")
+        self._own_ship(12)
+        prompt = await main.cmd_tow(self.ctx(), "")
+        self.assertIn("escape pod has no tow rig", prompt)
+
+    async def test_moving_while_towing_costs_five_turns_and_drags_the_hull(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15,
+                                       turns_remaining=50, towing_ship_id=12)
+        self._own_ship(12, sector_id=15)
+
+        prompt = await main.cmd_move(self.ctx(), "16")
+
+        self.assertIn("Moved to Sec16.", prompt)
+        self.assertIn("Towing Tester's Kestrel #12: -5 turns", prompt)
+        self.assertEqual(STATE["player"]["turns_remaining"], 45)
+        self.assertEqual(STATE["parked_ships"][12]["sector_id"], 16)  # dragged along
+        self.assertEqual(STATE["ship_move_log"], [(12, 16)])
+        # The towed hull shows on the arrival's sector info too.
+        self.assertIn("Unmanned: Tester's Kestrel #12", prompt)
+
+    async def test_move_is_refused_when_towing_with_too_few_turns(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15,
+                                       turns_remaining=3, towing_ship_id=12)
+        self._own_ship(12, sector_id=15)
+
+        prompt = await main.cmd_move(self.ctx(), "16")
+
+        self.assertIn("Towing burns 5 turns per sector and you have 3 left", prompt)
+        self.assertEqual(STATE["player"]["sector_id"], 15)      # never moved
+        self.assertEqual(STATE["player"]["turns_remaining"], 3)  # nothing spent
+        self.assertEqual(STATE["parked_ships"][12]["sector_id"], 15)
+
+    async def test_tow_again_releases_and_the_hull_stays_put(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=16,
+                                       towing_ship_id=12)
+        self._own_ship(12, sector_id=16)
+        prompt = await main.cmd_tow(self.ctx(), "")
+        self.assertIn("Tow released -- Tester's Kestrel #12 stays parked in Sec16", prompt)
+        self.assertIsNone(STATE["player"]["towing_ship_id"])
+
+    async def test_status_shows_the_tow(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15,
+                                       towing_ship_id=12)
+        self._own_ship(12, sector_id=15)
+        status = await main.cmd_status(self.ctx(), "")
+        self.assertIn("Towing Kestrel #12 (5 turns/sector)", status)
+
+    async def test_p2p_is_refused_while_towing(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15, towing_ship_id=12)
+        self._own_ship(12, sector_id=15)
+        prompt = await main.cmd_p2p(self.ctx(), "")
+        self.assertIn("Can't run a P2P shuttle while towing", prompt)
+
+
+class BoardCommandTests(unittest.IsolatedAsyncioTestCase):
+    """The board/swap command: taking the helm of your own parked ship,
+    parking the old hull in its place (or scuttling an escape pod)."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        _reset_multiship_state()
+        STATE["players_by_id"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    def _spare(self, ship_id=12, sector_id=15, **extra):
+        defaults = dict(ship_type="Kestrel", holds_total=15, fighters=20,
+                        shields=20, mines=0, probes=3, fuel_ore=4, organics=0,
+                        equipment=0, station_core=0)
+        defaults.update(extra)
+        STATE["parked_ships"][ship_id] = _parked(
+            ship_id, owner_id=1, owner_name="Tester", sector_id=sector_id, **defaults
+        )
+
+    async def test_boarding_swaps_hulls_and_parks_the_old_one(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15,
+                                       ship_type="Falcon", ship_id=50,
+                                       holds_total=20, fighters=10, shields=10,
+                                       fuel_ore=7)
+        self._spare(12)
+
+        prompt = await main.cmd_board(self.ctx(), "#12")
+
+        self.assertIn("You board your Kestrel #12", prompt)
+        self.assertIn("your Falcon #50 is parked here", prompt)
+        self.assertIn("Aboard: 20 ftr, 20 shd, cargo f4/o0/e0", prompt)
+        p = STATE["player"]
+        self.assertEqual(p["ship_type"], "Kestrel")
+        self.assertEqual(p["ship_id"], 12)
+        self.assertEqual(p["fighters"], 20)
+        self.assertEqual(p["fuel_ore"], 4)       # the spare's cargo, as left
+        old = STATE["parked_ships"][50]
+        self.assertEqual(old["ship_type"], "Falcon")
+        self.assertEqual(old["sector_id"], 15)
+        self.assertEqual(old["fuel_ore"], 7)     # old hull keeps its cargo
+
+    async def test_a_pod_pilot_boarding_scuttles_the_pod(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15,
+                                       ship_type="Escape Pod", ship_id=50,
+                                       holds_total=0, fighters=0, shields=0)
+        self._spare(12)
+
+        prompt = await main.cmd_board(self.ctx(), "#12")
+
+        self.assertIn("your escape pod is scuttled", prompt)
+        self.assertEqual(STATE["player"]["ship_type"], "Kestrel")
+        self.assertNotIn(50, STATE["parked_ships"])  # no pod left behind
+
+    async def test_cannot_board_a_ship_you_do_not_own(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15)
+        STATE["parked_ships"][12] = _parked(12, owner_id=2, owner_name="Bob",
+                                            sector_id=15)
+        prompt = await main.cmd_board(self.ctx(), "#12")
+        self.assertIn("isn't yours -- you can't board it", prompt)
+        self.assertEqual(STATE["player"]["ship_type"], "Falcon")
+
+    async def test_boarding_releases_a_tow(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15,
+                                       towing_ship_id=13)
+        self._spare(12)
+        self._spare(13, ship_type="Mule")
+
+        await main.cmd_board(self.ctx(), "#12")
+
+        self.assertIsNone(STATE["player"]["towing_ship_id"])
+
+    async def test_guided_board_cycles_own_ships(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=15)
+        self._spare(12, ship_type="Kestrel")
+        self._spare(13, ship_type="Mule")
+
+        prompt = await main.cmd_board(self.ctx(), "")
+        self.assertIn("Board your Kestrel #12? yes/no", prompt)
+        prompt = await main.cmd_board_step(self.ctx(), "no")
+        self.assertIn("Board your Mule #13? yes/no", prompt)
+        prompt = await main.cmd_board_step(self.ctx(), "yes")
+        self.assertIn("You board your Mule #13", prompt)
+        self.assertNotIn(PUBKEY, main.PENDING_BOARDS)
+
+    async def test_nothing_of_yours_here_to_board(self):
+        STATE["player"] = fresh_player(id=1, sector_id=15)
+        prompt = await main.cmd_board(self.ctx(), "")
+        self.assertIn("No unmanned ships here to board", prompt)
+
+
+class ShipyardMultiShipTests(unittest.IsolatedAsyncioTestCase):
+    """The shipyard's multi-ship additions: buying while KEEPING the old
+    hull (parked at the Stardock, full price), and selling a parked hull
+    outright via its s<id> menu entry."""
+
+    def setUp(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        _reset_multiship_state()
+        STATE["trade_log"] = []
+        STATE["upgrade_log"] = []
+        STATE["ship_log"] = []
+        STATE["port"] = {}
+        STATE["ports"] = {}
+        STATE["warps"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    async def dock(self):
+        return await main.cmd_trade(self.ctx(), "")
+
+    async def say(self, message):
+        return await main.cmd_stardock_step(self.ctx(), message)
+
+    async def enter_shipyard(self):
+        await self.dock()
+        # Shipyard is always one past the refit options (5 for a Falcon).
+        return await self.say("5")
+
+    async def test_buying_and_keeping_parks_the_old_ship_at_full_price(self):
+        STATE["player"] = fresh_player(credits=250000, ship_type="Falcon",
+                                       ship_id=50, fighters=10, shields=10,
+                                       fuel_ore=3)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        await self.say("6")  # SS Endeavour -> sell-or-keep question
+        prompt = await self.say("keep")
+        self.assertIn(
+            "Buy the SS Endeavour for 200000cr and keep your Falcon parked in Sec1? yes/no",
+            prompt,
+        )
+
+        prompt = await self.say("yes")
+        self.assertIn(
+            "Welcome aboard the SS Endeavour! -200000cr. Your Falcon is parked in Sec1.",
+            prompt,
+        )
+
+        p = STATE["player"]
+        self.assertEqual(p["ship_type"], "SS Endeavour")
+        self.assertEqual(p["credits"], 250000 - 200000)   # FULL price, no trade-in
+        self.assertEqual(p["fuel_ore"], 0)                # new hull starts empty
+        # The old Falcon is parked right here with everything aboard.
+        old = STATE["parked_ships"][50]
+        self.assertEqual(old["ship_type"], "Falcon")
+        self.assertEqual(old["sector_id"], 1)
+        self.assertEqual(old["fighters"], 10)
+        self.assertEqual(old["fuel_ore"], 3)
+        self.assertEqual(
+            STATE["park_buy_log"],
+            [("SS Endeavour", 50, 0, 50, 0, -200000, 1)],
+        )
+        self.assertEqual(STATE["ship_log"], [])  # not an in-place hull swap
+
+    async def test_keep_is_refused_when_the_full_price_cannot_be_afforded(self):
+        # 198000cr affords the Endeavour only WITH the Kestrel trade-in
+        # (net 196000), not at the full 200000cr price.
+        STATE["player"] = fresh_player(credits=198000, ship_type="Kestrel",
+                                       holds_total=15, fighters=20, shields=20)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        prompt = await self.say("6")
+        self.assertIn("Reply sell/keep (or cancel).", prompt)
+
+        prompt = await self.say("keep")
+        self.assertIn("Can't afford to keep your Kestrel", prompt)
+        self.assertIn("full 200000cr", prompt)
+        self.assertEqual(STATE["player"]["ship_type"], "Kestrel")  # unchanged
+        self.assertEqual(STATE["park_buy_log"], [])
+        self.assertEqual(main.PENDING_UPGRADES[PUBKEY]["stage"], "shipyard_menu")
+
+    async def test_a_pod_pilot_is_never_asked_to_keep(self):
+        STATE["player"] = fresh_player(credits=10000, ship_type="Escape Pod",
+                                       holds_total=0, fighters=0, shields=0)
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.dock()
+        await self.say("2")  # pod refits: Shields/Probes -> shipyard is 3... use menu text instead
+        # A pod has only Shields + Probes refit lines, so the shipyard
+        # option number varies; drive it via the state directly.
+        main.PENDING_UPGRADES[PUBKEY] = {"stage": "shipyard_menu"}
+        prompt = await self.say("2")  # Kestrel
+        self.assertIn(
+            "Trade in your Escape Pod (0cr) for a Kestrel (8000cr)? Net cost: 8000cr. yes/no",
+            prompt,
+        )
+
+    async def test_shipyard_menu_lists_parked_ships_for_sale(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", credits=1000,
+                                       ship_type="Falcon", sector_id=1)
+        STATE["parked_ships"][12] = _parked(12, owner_id=1, owner_name="Tester",
+                                            sector_id=1, ship_type="Kestrel")
+        # Someone else's hull parked here is NOT for sale on your menu.
+        STATE["parked_ships"][13] = _parked(13, owner_id=2, owner_name="Bob",
+                                            sector_id=1, ship_type="Mule")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        prompt = await self.enter_shipyard()
+        self.assertIn("s12) Sell your parked Kestrel #12 -- 4000cr", prompt)
+        self.assertNotIn("s13)", prompt)
+
+    async def test_selling_a_parked_ship(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", credits=1000,
+                                       ship_type="Falcon", sector_id=1)
+        STATE["parked_ships"][12] = _parked(12, owner_id=1, owner_name="Tester",
+                                            sector_id=1, ship_type="Kestrel")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        prompt = await self.say("s12")
+        self.assertIn(
+            "Sell your parked Kestrel #12 for 4000cr? Anything still aboard it is lost. yes/no",
+            prompt,
+        )
+
+        prompt = await self.say("yes")
+        self.assertIn("Sold your parked Kestrel #12. +4000cr.", prompt)
+        self.assertNotIn(12, STATE["parked_ships"])
+        self.assertEqual(STATE["ship_delete_log"], [12])
+        self.assertEqual(STATE["player"]["credits"], 5000)
+        self.assertEqual(STATE["player"]["ship_type"], "Falcon")  # helm unchanged
+
+    async def test_selling_the_hull_you_are_towing_releases_the_tow(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", credits=0,
+                                       ship_type="Falcon", sector_id=1,
+                                       towing_ship_id=12)
+        STATE["parked_ships"][12] = _parked(12, owner_id=1, owner_name="Tester",
+                                            sector_id=1, ship_type="Kestrel")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        await self.say("s12")
+        prompt = await self.say("yes")
+
+        self.assertIn("Sold your parked Kestrel #12", prompt)
+        self.assertIsNone(STATE["player"]["towing_ship_id"])
+
+    async def test_cannot_sell_someone_elses_parked_ship(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", credits=0,
+                                       ship_type="Falcon", sector_id=1)
+        STATE["parked_ships"][13] = _parked(13, owner_id=2, owner_name="Bob",
+                                            sector_id=1, ship_type="Mule")
+        STATE["port"] = fresh_port("STARDOCK")
+
+        await self.enter_shipyard()
+        prompt = await self.say("s13")
+        self.assertIn("No parked ship of yours here with id #13", prompt)
+        self.assertIn(13, STATE["parked_ships"])
+
 
 
 if __name__ == "__main__":

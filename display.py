@@ -3,9 +3,12 @@ Read-only rendering of game state into the short text screens players
 see: sector info, the per-sector port/warps lines, and the command menu.
 """
 
-from db import get_port, get_adjacent_sectors, get_players_in_sector, get_station_in_sector
+from db import (
+    get_port, get_adjacent_sectors, get_players_in_sector,
+    get_station_in_sector, get_parked_ships_in_sector,
+)
 
-from core import COMMANDS
+from core import COMMANDS, ship_label
 
 
 def build_menu():
@@ -79,6 +82,15 @@ def build_sector_info(sector_id, viewer_id=None):
     if others:
         listed = ", ".join(f"{o['name']} ({o['fighters']} ftr)" for o in others)
         lines.append("Ships here: " + listed)
+    # Unmanned hulls parked here (spares left behind at a shipyard
+    # purchase, or a hull being towed through). Everyone's are listed --
+    # including the viewer's own -- named by owner + type + ship id so
+    # 'a #12' / 'tow #12' / 'board #12' can target them. Like the ships
+    # line, fighters are advertised but shields stay hidden.
+    parked = get_parked_ships_in_sector(sector_id)
+    if parked:
+        listed = ", ".join(f"{ship_label(s)} ({s['fighters']} ftr)" for s in parked)
+        lines.append("Unmanned: " + listed)
     station = get_station_in_sector(sector_id)
     if station is not None:
         # Mirror the ship display: show the station's fighter strength but

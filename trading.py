@@ -14,11 +14,17 @@ from db import (
     apply_port_restock,
     upgrade_ship_stat,
     buy_ship,
+    park_and_buy_ship,
+    get_ship,
+    get_parked_ships_in_sector,
+    delete_ship,
+    set_towing,
     get_player_with_ship,
     set_ship_station_core,
     adjust_player_credits,
     SHIP_CATALOG,
     DEFAULT_SHIP_TYPE,
+    ESCAPE_POD_SHIP,
     STARDOCK_PRICES,
     STATION_CORE_PRICE,
     STATION_CORE_HOLDS,
@@ -148,8 +154,25 @@ def build_shipyard_menu(p):
             f"  S) Sell your {p['ship_type']} -- trade in for {resale}cr "
             f"and return to the {DEFAULT_SHIP_TYPE}"
         )
+    # Any of the player's OWN ships parked in this sector can be sold
+    # outright (this is what towing a spare hull back to the Stardock is
+    # for). Sold as-is: the refund is the hull's trade-in value only;
+    # whatever's still aboard goes with it.
+    for ship in _own_parked_ships_here(p):
+        lines.append(
+            f"  s{ship['id']}) Sell your parked {ship['ship_type']} #{ship['id']} "
+            f"-- {sell_value(ship['ship_type'])}cr"
+        )
     lines.append(f"{p['credits']}cr available. Reply with a number to buy, 'S' to sell, or '0' to go back.")
     return "\n".join(lines)
+
+
+def _own_parked_ships_here(p):
+    """The player's own unmanned ships sitting in their current sector
+    (which, whenever the shipyard menu is being built, is the Stardock's
+    sector), in stable id order."""
+    return [s for s in get_parked_ships_in_sector(p["sector_id"])
+            if s["owner_id"] == p["id"]]
 
 
 def _build_sell_prompt(state, p, port, item):
@@ -468,14 +491,25 @@ async def cmd_stardock_step(ctx, message):
       "confirm"  -- "yes" commits the purchase and returns to the menu.
                     Anything else returns to the menu without buying.
 
-    Shipyard stages (buying a different hull, or selling the current one
-    back to the free default ship -- see build_shipyard_menu):
+    Shipyard stages (buying a different hull -- trading the current one
+    in OR keeping it parked -- selling the current hull back to the free
+    default ship, or selling a parked hull outright; see
+    build_shipyard_menu):
       "shipyard_menu"    -- reply with a hull's menu number to price out
                              buying it, 'S'/'sell' to price out selling
-                             the current ship, or '0' to go back to the
-                             main menu. Rejects buying the hull already
-                             owned, or one that can't be afforded even
-                             after the trade-in, before moving to
+                             the current ship, 's<id>' to price out
+                             selling a parked ship of yours in this
+                             sector, or '0' to go back to the main menu.
+                             Rejects buying the hull already owned, or
+                             one that can't be afforded even after the
+                             trade-in. A buy moves to "shipyard_keep"
+                             (a pod pilot skips straight to
+                             "shipyard_confirm" -- a pod isn't kept).
+      "shipyard_keep"    -- 'sell' trades the current hull in (net
+                             cost); 'keep' parks it here and pays the
+                             full price (rejected if full price can't
+                             be afforded); 'no'/'back' returns to the
+                             shipyard menu. Either choice moves to
                              "shipyard_confirm".
       "shipyard_confirm" -- "yes" commits the transaction and returns to
                              the main menu. Anything else returns to the
@@ -603,6 +637,25 @@ async def cmd_stardock_step(ctx, message):
                 f"for {resale}cr? yes/no"
             )
 
+        parked_sale = re.match(r"^s(\d+)$", lower)
+        if parked_sale:
+            ship_id = int(parked_sale.group(1))
+            ship = next((s for s in _own_parked_ships_here(p) if s["id"] == ship_id), None)
+            if ship is None:
+                return (
+                    f"No parked ship of yours here with id #{ship_id}.\n\n"
+                    + build_shipyard_menu(p)
+                )
+            resale = sell_value(ship["ship_type"])
+            state.update({
+                "stage": "shipyard_confirm", "action": "sell_parked",
+                "parked_ship_id": ship_id, "resale": resale,
+            })
+            return (
+                f"Sell your parked {ship['ship_type']} #{ship_id} for {resale}cr? "
+                "Anything still aboard it is lost. yes/no"
+            )
+
         if not re.match(r"^\d+$", text):
             return "Reply with a number to buy, 'S' to sell, or '0' to go back.\n\n" + build_shipyard_menu(p)
         choice = int(text)
@@ -624,17 +677,59 @@ async def cmd_stardock_step(ctx, message):
                 + build_shipyard_menu(p)
             )
 
+        if p["ship_type"] == ESCAPE_POD_SHIP:
+            # A pod isn't a hull worth keeping -- skip the keep question
+            # and go straight to the trade-in confirm (trade-in is 0cr).
+            state.update({
+                "stage": "shipyard_confirm",
+                "action": "buy",
+                "ship_name": ship_name,
+                "trade_in": trade_in,
+                "net_cost": net_cost,
+            })
+            return (
+                f"Trade in your {p['ship_type']} ({trade_in}cr) for a {ship_name} "
+                f"({ship['price']}cr)? Net cost: {net_cost}cr. yes/no"
+            )
+
         state.update({
-            "stage": "shipyard_confirm",
-            "action": "buy",
+            "stage": "shipyard_keep",
             "ship_name": ship_name,
             "trade_in": trade_in,
             "net_cost": net_cost,
         })
         return (
-            f"Trade in your {p['ship_type']} ({trade_in}cr) for a {ship_name} "
-            f"({ship['price']}cr)? Net cost: {net_cost}cr. yes/no"
+            f"Buying a {ship_name} ({ship['price']}cr). Sell your {p['ship_type']} "
+            f"as trade-in (+{trade_in}cr, net {net_cost}cr), or keep it parked here in "
+            f"Sec{p['sector_id']} (full {ship['price']}cr)? Reply sell/keep (or cancel)."
         )
+
+    if state["stage"] == "shipyard_keep":
+        ship_name = state["ship_name"]
+        ship = SHIP_CATALOG[ship_name]
+        if lower in ("s", "sell", "trade", "trade-in"):
+            state.update({"stage": "shipyard_confirm", "action": "buy"})
+            return (
+                f"Trade in your {p['ship_type']} ({state['trade_in']}cr) for a {ship_name} "
+                f"({ship['price']}cr)? Net cost: {state['net_cost']}cr. yes/no"
+            )
+        if lower in ("k", "keep", "park"):
+            if ship["price"] > p["credits"]:
+                state["stage"] = "shipyard_menu"
+                return (
+                    f"Can't afford to keep your {p['ship_type']} -- the {ship_name} costs "
+                    f"the full {ship['price']}cr without a trade-in, you have "
+                    f"{p['credits']}cr.\n\n" + build_shipyard_menu(p)
+                )
+            state.update({"stage": "shipyard_confirm", "action": "buy_keep"})
+            return (
+                f"Buy the {ship_name} for {ship['price']}cr and keep your "
+                f"{p['ship_type']} parked in Sec{p['sector_id']}? yes/no"
+            )
+        if lower in ("no", "n", "0", "back"):
+            state["stage"] = "shipyard_menu"
+            return build_shipyard_menu(p)
+        return "Reply 'sell' to trade in, 'keep' to park your current ship, or 'cancel'."
 
     if state["stage"] == "shipyard_confirm":
         if lower not in ("y", "yes"):
@@ -652,6 +747,46 @@ async def cmd_stardock_step(ctx, message):
             result_line = (
                 f"Sold your old ship. Welcome back to the {DEFAULT_SHIP_TYPE}. "
                 f"+{state['resale']}cr."
+            )
+        elif state["action"] == "sell_parked":
+            # Re-validate: the ship must still exist, still be theirs, and
+            # still be sitting in this sector (it could have been destroyed
+            # -- or this could be a stale confirm).
+            ship = get_ship(state["parked_ship_id"])
+            if (ship is None or ship["owner_id"] != p["id"]
+                    or ship["sector_id"] != p["sector_id"]):
+                state["stage"] = "shipyard_menu"
+                return ("That ship is no longer parked here.\n\n"
+                        + build_shipyard_menu(p))
+            # If they were towing this very hull, the sale releases the
+            # line (delete_ship also clears any towing reference, but be
+            # explicit for the player-visible state).
+            if p.get("towing_ship_id") == ship["id"]:
+                set_towing(p["id"], None)
+            delete_ship(ship["id"])
+            adjust_player_credits(p["id"], state["resale"])
+            result_line = (
+                f"Sold your parked {ship['ship_type']} #{ship['id']}. "
+                f"+{state['resale']}cr."
+            )
+        elif state["action"] == "buy_keep":
+            ship_name = state["ship_name"]
+            ship = SHIP_CATALOG[ship_name]
+            if ship["price"] > p["credits"]:
+                # Credits could have changed since the keep prompt.
+                state["stage"] = "shipyard_menu"
+                return (f"You no longer have the full {ship['price']}cr.\n\n"
+                        + build_shipyard_menu(p))
+            old_type = p["ship_type"]
+            park_and_buy_ship(
+                p["id"], p["sector_id"], ship_name,
+                ship["base_holds"], ship["base_fighters"], ship["base_shields"],
+                ship["base_mines"],
+                credit_delta=-ship["price"],
+            )
+            result_line = (
+                f"Welcome aboard the {ship_name}! -{ship['price']}cr. "
+                f"Your {old_type} is parked in Sec{p['sector_id']}."
             )
         else:
             ship_name = state["ship_name"]
