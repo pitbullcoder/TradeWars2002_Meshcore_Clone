@@ -327,12 +327,47 @@ _SHIP_STAT_KEYS = ("ship_type", "holds_total", "fighters", "shields", "mines",
 
 
 def _stub_get_parked_ships_in_sector(sector_id):
-    # Stable id order, mirroring the real query's ORDER BY ships.id.
+    # Stable id order, mirroring the real query's ORDER BY ships.id --
+    # and, like the real query, ships docked inside a station are
+    # excluded (that exclusion is what shelters them).
     return sorted(
         (dict(s) for s in STATE["parked_ships"].values()
-         if s.get("sector_id") == sector_id),
+         if s.get("sector_id") == sector_id
+         and s.get("docked_station_id") is None),
         key=lambda s: s["id"],
     )
+
+
+def _stub_get_ships_docked_at_station(station_id):
+    return sorted(
+        (dict(s) for s in STATE["parked_ships"].values()
+         if s.get("docked_station_id") == station_id),
+        key=lambda s: s["id"],
+    )
+
+
+def _stub_dock_ship_at_station(ship_id, station_id):
+    s = STATE["parked_ships"].get(ship_id)
+    if s is not None:
+        s["docked_station_id"] = station_id
+    # Mirror the real function: docking releases any tow on the hull.
+    for pl in [STATE["player"], *STATE["players_by_id"].values()]:
+        if pl.get("towing_ship_id") == ship_id:
+            pl["towing_ship_id"] = None
+
+
+def _stub_undock_ship(ship_id):
+    s = STATE["parked_ships"].get(ship_id)
+    if s is not None:
+        s["docked_station_id"] = None
+
+
+# Mirrors db.station_dock_capacity (pure).
+DOCKED_SHIPS_PER_LEVEL = 2
+
+
+def station_dock_capacity(level):
+    return DOCKED_SHIPS_PER_LEVEL * level
 
 
 def _stub_get_ship(ship_id):
@@ -678,6 +713,15 @@ def _stub_create_station(owner_id, owner_name, sector_id):
 
 def _stub_delete_station(station_id):
     STATE["stations"].pop(station_id, None)
+    # Mirror the real delete_station: docked spares go down with it (and
+    # any tow reference to one is cleared).
+    doomed = [sid for sid, s in STATE["parked_ships"].items()
+              if s.get("docked_station_id") == station_id]
+    for sid in doomed:
+        STATE["parked_ships"].pop(sid, None)
+        for pl in [STATE["player"], *STATE["players_by_id"].values()]:
+            if pl.get("towing_ship_id") == sid:
+                pl["towing_ship_id"] = None
 
 
 def _stub_deposit_to_station(station_id, fuel=0, organics=0, equipment=0):
@@ -762,6 +806,11 @@ def _install_stub_modules():
     db_stub.spend_turns = _stub_spend_turns
     db_stub.swap_active_ship = _stub_swap_active_ship
     db_stub.park_and_buy_ship = _stub_park_and_buy_ship
+    db_stub.get_ships_docked_at_station = _stub_get_ships_docked_at_station
+    db_stub.dock_ship_at_station = _stub_dock_ship_at_station
+    db_stub.undock_ship = _stub_undock_ship
+    db_stub.station_dock_capacity = station_dock_capacity
+    db_stub.DOCKED_SHIPS_PER_LEVEL = DOCKED_SHIPS_PER_LEVEL
     db_stub.sell_value = _stub_sell_value
     db_stub.SHIP_CATALOG = SHIP_CATALOG
     db_stub.DEFAULT_SHIP_TYPE = DEFAULT_SHIP_TYPE
@@ -3634,6 +3683,7 @@ def _parked(ship_id, owner_id, owner_name, sector_id, ship_type="Kestrel",
         "id": ship_id, "owner_id": owner_id, "owner_name": owner_name,
         "sector_id": sector_id, "ship_type": ship_type,
         "fighters": fighters, "shields": shields,
+        "docked_station_id": None,
     }
     ship.update(extra)
     return ship
@@ -4194,6 +4244,228 @@ class ShipyardMultiShipTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No parked ship of yours here with id #13", prompt)
         self.assertIn(13, STATE["parked_ships"])
 
+
+
+class StationDockingTests(unittest.IsolatedAsyncioTestCase):
+    """Sheltering spare ships in a station's docking bays: the station
+    menu dock/undock flows, capacity per level (2 x level), the
+    protection docked hulls get from attack/tow/board and the Unmanned
+    line, and going down with the station when it's destroyed."""
+
+    def setUp(self):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.reload(main)
+        _reset_multiship_state()
+        STATE["stations"] = {}
+        STATE["next_station_id"] = 1
+        STATE["players_by_id"] = {}
+        STATE["attack_events"] = []
+        STATE["kills"] = []
+        STATE["defense_log"] = []
+        STATE["warps"] = {19: [20], 20: [19, 21], 21: [20]}
+        STATE["ports"] = {}
+        STATE["port"] = {}
+        STATE["sector_mines"] = {}
+        STATE["sector_players"] = {}
+
+    def ctx(self):
+        return FakeCtx(PUBKEY, dict(STATE["player"]))
+
+    def _station(self, owner_id=1, owner_name="Tester", sector=20, **over):
+        sid = STATE["next_station_id"]
+        STATE["next_station_id"] += 1
+        st = {
+            "id": sid, "sector_id": sector, "owner_id": owner_id,
+            "owner_name": owner_name, "level": 1, "shields": 0, "fighters": 0,
+            "shields_enabled": 0, "fuel": 0, "organics": 0, "equipment": 0,
+            "posture": "defensive", "engage_pct": 100,
+            "last_fuel_burn": "2026-06-27T12:00:00+00:00",
+            "upgrade_to": None, "upgrade_started_at": None,
+        }
+        st.update(over)
+        STATE["stations"][sid] = st
+        return st
+
+    def _spare(self, ship_id, sector_id=20, ship_type="Kestrel", **extra):
+        STATE["parked_ships"][ship_id] = _parked(
+            ship_id, owner_id=1, owner_name="Tester", sector_id=sector_id,
+            ship_type=ship_type, **extra
+        )
+
+    async def dock(self):
+        return await main.cmd_station(self.ctx(), "")
+
+    async def say(self, text):
+        return await main.cmd_station_step(self.ctx(), text)
+
+    # --- the menu & docking flow ---
+
+    async def test_menu_advertises_the_docking_bays(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        self._station()
+        menu = await self.dock()
+        self.assertIn("6) Dock a spare ship (0/2 bays used)", menu)
+        self.assertNotIn("7) Undock", menu)   # nothing docked yet
+
+    async def test_docking_a_spare_shelters_it(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        self._station()
+        self._spare(12)
+
+        await self.dock()
+        prompt = await self.say("6")
+        self.assertIn("Dock your Kestrel #12? yes/no", prompt)
+
+        reply = await self.say("yes")
+        self.assertIn("Docked your Kestrel #12 -- it's sheltered from attack", reply)
+        self.assertEqual(STATE["parked_ships"][12]["docked_station_id"], 1)
+        self.assertIn("Docked ships (1/2): Kestrel #12", reply)  # station status
+        self.assertIn("7) Undock a ship", reply)                 # menu grew
+
+    async def test_dock_all_stops_at_capacity(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        self._station(level=1)                       # 2 bays
+        self._spare(12)
+        self._spare(13, ship_type="Mule")
+        self._spare(14, ship_type="Falcon")
+
+        await self.dock()
+        await self.say("6")
+        reply = await self.say("all")
+
+        self.assertIn("Docked Kestrel #12, Mule #13 at the station. Bays are now full.", reply)
+        self.assertEqual(STATE["parked_ships"][12]["docked_station_id"], 1)
+        self.assertEqual(STATE["parked_ships"][13]["docked_station_id"], 1)
+        self.assertIsNone(STATE["parked_ships"][14]["docked_station_id"])  # no room
+
+    async def test_capacity_scales_with_level(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        self._station(level=3)                       # 6 bays
+        menu = await self.dock()
+        self.assertIn("6) Dock a spare ship (0/6 bays used)", menu)
+
+    async def test_dock_refused_when_bays_are_full(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        self._station(level=1)
+        self._spare(12, docked_station_id=1)
+        self._spare(13, ship_type="Mule", docked_station_id=1)
+        self._spare(14)
+
+        await self.dock()
+        reply = await self.say("6")
+        self.assertIn("Docking bays are full (2/2)", reply)
+        self.assertIsNone(STATE["parked_ships"][14]["docked_station_id"])
+
+    async def test_nothing_here_to_dock(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        self._station()
+        await self.dock()
+        reply = await self.say("6")
+        self.assertIn("No spare ships of yours out in this sector to dock", reply)
+
+    async def test_undocking_returns_the_ship_to_the_open(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        self._station()
+        self._spare(12, docked_station_id=1)
+
+        await self.dock()
+        prompt = await self.say("7")
+        self.assertIn("Undock your Kestrel #12? yes/no", prompt)
+        reply = await self.say("yes")
+        self.assertIn("Undocked your Kestrel #12 -- parked out in Sec20 (attackable again)", reply)
+        self.assertIsNone(STATE["parked_ships"][12]["docked_station_id"])
+
+    async def test_docking_releases_a_tow_on_that_hull(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20,
+                                       towing_ship_id=12)
+        self._station()
+        self._spare(12)
+
+        await self.dock()
+        await self.say("6")
+        await self.say("yes")
+
+        self.assertIsNone(STATE["player"]["towing_ship_id"])
+        self.assertEqual(STATE["parked_ships"][12]["docked_station_id"], 1)
+
+    # --- the protection itself ---
+
+    async def test_docked_ships_vanish_from_the_unmanned_line_but_show_as_docked(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        self._station()
+        self._spare(12, docked_station_id=1)
+        self._spare(13, ship_type="Mule")            # out in the open
+
+        info = await main.cmd_info(self.ctx(), "")
+
+        self.assertIn("Unmanned: Tester's Mule #13", info)
+        self.assertNotIn("Kestrel #12", info.split("Docked:")[0])  # not on Unmanned
+        self.assertIn("Docked: Tester's Kestrel #12", info)        # visible as docked
+
+    async def test_docked_ships_cannot_be_attacked(self):
+        STATE["player"] = fresh_player(id=2, name="Rival", sector_id=20, fighters=500)
+        self._station(owner_id=1, owner_name="Tester")
+        STATE["parked_ships"][12] = _parked(12, owner_id=1, owner_name="Tester",
+                                            sector_id=20, docked_station_id=1)
+
+        prompt = await main.cmd_attack(self.ctx(), "#12")
+        self.assertIn("No unmanned ship #12 here", prompt)
+
+        # And the guided cycle only offers the station, never the docked hull.
+        prompt = await main.cmd_attack(self.ctx(), "")
+        self.assertIn("Attack Space Station - Tester", prompt)
+        self.assertNotIn("Kestrel #12", prompt)
+
+    async def test_docked_ships_cannot_be_towed_or_boarded(self):
+        STATE["player"] = fresh_player(id=1, name="Tester", sector_id=20)
+        self._station()
+        self._spare(12, docked_station_id=1)
+
+        self.assertIn("No unmanned ship #12 here",
+                      await main.cmd_tow(self.ctx(), "#12"))
+        self.assertIn("No unmanned ship #12 here",
+                      await main.cmd_board(self.ctx(), "#12"))
+        self.assertEqual(STATE["parked_ships"][12]["docked_station_id"], 1)
+
+    # --- going down with the station ---
+
+    async def test_docked_ships_are_destroyed_with_the_station(self):
+        STATE["player"] = fresh_player(id=2, name="Rival", sector_id=20,
+                                       fighters=500)
+        self._station(owner_id=1, owner_name="Tester", fighters=10, shields=20)
+        STATE["parked_ships"][12] = _parked(12, owner_id=1, owner_name="Tester",
+                                            sector_id=20, docked_station_id=1)
+        STATE["parked_ships"][13] = _parked(13, owner_id=1, owner_name="Tester",
+                                            sector_id=20, ship_type="Mule",
+                                            docked_station_id=1)
+
+        await main.cmd_attack(self.ctx(), "station")
+        report = await main.cmd_attack_step(self.ctx(), "all")
+
+        self.assertIn("You destroyed Space Station - Tester!", report)
+        self.assertIn("2 docked ships went down with it.", report)
+        self.assertNotIn(12, STATE["parked_ships"])
+        self.assertNotIn(13, STATE["parked_ships"])
+        outcomes = [e["outcome"] for e in STATE["attack_events"]]
+        self.assertEqual(outcomes.count("station_destroyed"), 1)
+        self.assertEqual(outcomes.count("unmanned_destroyed"), 2)
+        self.assertTrue(all(e["victim_id"] == 1 for e in STATE["attack_events"]))
+
+    async def test_undocked_ships_do_not_share_the_stations_fate(self):
+        STATE["player"] = fresh_player(id=2, name="Rival", sector_id=20,
+                                       fighters=500)
+        self._station(owner_id=1, owner_name="Tester", fighters=0, shields=0)
+        STATE["parked_ships"][13] = _parked(13, owner_id=1, owner_name="Tester",
+                                            sector_id=20, ship_type="Mule")
+
+        await main.cmd_attack(self.ctx(), "station")
+        report = await main.cmd_attack_step(self.ctx(), "all")
+
+        self.assertIn("You destroyed Space Station - Tester!", report)
+        self.assertNotIn("went down with it", report)
+        self.assertIn(13, STATE["parked_ships"])     # still out there, still loot
 
 
 if __name__ == "__main__":

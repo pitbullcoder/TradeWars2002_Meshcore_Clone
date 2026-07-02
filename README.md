@@ -196,7 +196,9 @@ mines, probes, even a carried Station Core kit).
   Sectors 1–10, including at the Stardock, are protected). They defend with
   whatever fighters and shields were left aboard, using the normal combat
   math. A destroyed unmanned ship is simply gone — no pod, no kill-log entry
-  — but the owner gets a while-you-were-away notice.
+  — but the owner gets a while-you-were-away notice. For protection out in
+  the wild, spares can be **docked inside your own space station** (see
+  *Space stations* below).
 
 ### Navigation
 
@@ -249,6 +251,16 @@ hold territory, stockpile materials, and fight on your behalf.
 * **It's yours alone.** Only the owner can `dock` at a station to manage it.
   It appears on the sector info screen as **`Space Station - <owner>`** with
   its fighter count (shields stay hidden, just like ships).
+* **Docking bays for your spare ships.** A station shelters your unmanned
+  hulls: **2 bays per level** (Lvl 1 → 2 ships … Lvl 4 → 8). From the station
+  menu, **Dock a spare ship** tucks any of your parked ships in the sector
+  inside; while docked they **can't be attacked, towed, or boarded** and drop
+  off the sector's `Unmanned:` line — instead they're listed on a `Docked:`
+  line, visible to everyone but out of reach. **Undock** returns a ship to
+  the open (attackable again) so you can board, tow, or sell it. The catch:
+  if the station is **destroyed, every ship docked inside is destroyed with
+  it** — the attacker is told how many went down, and you get a notice per
+  lost hull.
 * **Arming it.** A fresh station is **Level 1** with a ceiling of **1000
   shields and 1000 fighters**, both starting at **0**. Dock to:
   * **Deposit** fuel, organics, and equipment from your cargo into the

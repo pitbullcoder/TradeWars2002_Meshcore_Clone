@@ -64,6 +64,7 @@ from db import (
     apply_station_upkeep,
     set_station_defenses,
     delete_station,
+    get_ships_docked_at_station,
     get_ship,
     get_parked_ships_in_sector,
     set_parked_ship_defenses,
@@ -804,10 +805,20 @@ def _resolve_attack_on_station(ctx, target, engaged):
     set_ship_defenses(p["id"], p["shields"], fighters_after)  # keep shields, spend fighters
 
     if destroyed:
+        # Spares docked inside share the station's fate: delete_station
+        # removes them with it. The owner gets one notice per lost hull on
+        # top of the station notice; the attacker's report counts them.
+        docked = get_ships_docked_at_station(target["station_id"])
         delete_station(target["station_id"])
         record_attack_event(target["owner_id"], p["name"], p["sector_id"], "station_destroyed")
+        for _ship in docked:
+            record_attack_event(target["owner_id"], p["name"], p["sector_id"], "unmanned_destroyed")
+        docked_note = (
+            f" {_plural(len(docked), 'docked ship')} went down with it."
+            if docked else ""
+        )
         return (
-            f"You destroyed {target['name']}! It's wreckage now. "
+            f"You destroyed {target['name']}! It's wreckage now.{docked_note} "
             f"You have {fighters_after} fighters."
         )
 

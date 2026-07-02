@@ -297,6 +297,19 @@ def init_db():
         )
     """)
 
+    # Which station a spare (parked) ship is docked inside, NULL when it's
+    # sitting out in the open. Docked ships are excluded from
+    # get_parked_ships_in_sector, which is what shelters them from attack
+    # (and from tow/board targeting) until they're undocked -- and what
+    # ties their fate to the station's (see delete_station). Placed after
+    # the stations table so the FK target exists.
+    try:
+        conn.execute(
+            "ALTER TABLE ships ADD COLUMN docked_station_id INTEGER REFERENCES stations(id)"
+        )
+    except sqlite3.OperationalError:
+        pass  # already has the column
+
     conn.commit()
     conn.close()
 
@@ -595,6 +608,16 @@ def station_daily_fuel_burn(level):
     `level` (rounded). This is the cost of keeping shields enabled."""
     max_shields, _ = station_caps(level)
     return round(SHIELD_FUEL_BURN_PER_SHIELD * max_shields)
+
+
+# How many spare ships a station can shelter in its docking bays, per
+# station level: Lvl 1 -> 2 ships, Lvl 2 -> 4, Lvl 3 -> 6, Lvl 4 -> 8.
+DOCKED_SHIPS_PER_LEVEL = 2
+
+
+def station_dock_capacity(level):
+    """Max spare ships a station at `level` can hold in its docking bays."""
+    return DOCKED_SHIPS_PER_LEVEL * level
 
 # Stardock refit prices, in credits per unit. Keyed by the ships column
 # each upgrade applies to, so callers can go straight from a column name
@@ -917,17 +940,20 @@ def get_ship(ship_id):
 
 
 def get_parked_ships_in_sector(sector_id):
-    """Every UNMANNED ship sitting in `sector_id` (including one being
-    towed by a player standing there -- it follows its tower's sector),
-    in stable id order, each with owner_id/owner_name and enough combat
-    stats to size up or resolve an attack. Active ships never appear
-    here (their sector_id is NULL)."""
+    """Every UNMANNED ship sitting OUT IN THE OPEN in `sector_id`
+    (including one being towed by a player standing there -- it follows
+    its tower's sector), in stable id order, each with
+    owner_id/owner_name and enough combat stats to size up or resolve an
+    attack. Active ships never appear here (their sector_id is NULL),
+    and neither do ships docked inside a station -- that exclusion is
+    exactly what makes docking protective, since attack/tow/board all
+    target through this query."""
     conn = get_connection()
     rows = conn.execute(
         """SELECT ships.id, ships.player_id AS owner_id, players.name AS owner_name,
                   ships.ship_type, ships.fighters, ships.shields
            FROM ships JOIN players ON players.id = ships.player_id
-           WHERE ships.sector_id = ?
+           WHERE ships.sector_id = ? AND ships.docked_station_id IS NULL
            ORDER BY ships.id""",
         (sector_id,)
     ).fetchall()
@@ -982,6 +1008,51 @@ def set_towing(player_id, ship_id):
     )
     conn.commit()
     conn.close()
+
+
+def dock_ship_at_station(ship_id, station_id):
+    """Shelter a spare ship inside a station's docking bay. Any tow line
+    attached to the hull is released in the same transaction (you can't
+    drag a ship that's inside a hangar). Caller validates ownership,
+    location, and bay capacity."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE players SET towing_ship_id = NULL WHERE towing_ship_id = ?",
+        (ship_id,)
+    )
+    conn.execute(
+        "UPDATE ships SET docked_station_id = ? WHERE id = ?",
+        (station_id, ship_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def undock_ship(ship_id):
+    """Move a docked spare back out into the open: it becomes an ordinary
+    parked ship in its sector -- boardable, towable, and attackable again."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE ships SET docked_station_id = NULL WHERE id = ?", (ship_id,)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_ships_docked_at_station(station_id):
+    """Every spare ship sheltering inside `station_id`'s docking bays, in
+    stable id order, shaped like get_parked_ships_in_sector's rows."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT ships.id, ships.player_id AS owner_id, players.name AS owner_name,
+                  ships.ship_type, ships.fighters, ships.shields
+           FROM ships JOIN players ON players.id = ships.player_id
+           WHERE ships.docked_station_id = ?
+           ORDER BY ships.id""",
+        (station_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 
 def move_player_to_sector(player_id, sector_id):
@@ -1357,7 +1428,17 @@ def create_station(owner_id, owner_name, sector_id):
 
 
 def delete_station(station_id):
+    """Remove a destroyed station -- and every spare ship docked inside
+    it, which shares its fate. Any tow reference to a doomed hull is
+    cleared first (defensive; docking already releases tows)."""
     conn = get_connection()
+    conn.execute(
+        """UPDATE players SET towing_ship_id = NULL
+           WHERE towing_ship_id IN
+             (SELECT id FROM ships WHERE docked_station_id = ?)""",
+        (station_id,)
+    )
+    conn.execute("DELETE FROM ships WHERE docked_station_id = ?", (station_id,))
     conn.execute("DELETE FROM stations WHERE id = ?", (station_id,))
     conn.commit()
     conn.close()

@@ -24,6 +24,12 @@ from db import (
     adjust_player_credits,
     station_caps,
     station_daily_fuel_burn,
+    station_dock_capacity,
+    get_parked_ships_in_sector,
+    get_ships_docked_at_station,
+    get_ship,
+    dock_ship_at_station,
+    undock_ship,
     SAFE_ZONE_MAX_SECTOR,
     STATION_MAX_LEVEL,
     STATION_UPGRADES,
@@ -55,6 +61,11 @@ def build_station_status(station):
         f"Stockpile: {station['fuel']} fuel, {station['organics']} organics, "
         f"{station['equipment']} equipment",
     ]
+    docked = get_ships_docked_at_station(station["id"])
+    if docked:
+        cap = station_dock_capacity(station["level"])
+        listed = ", ".join(f"{s['ship_type']} #{s['id']}" for s in docked)
+        lines.append(f"Docked ships ({len(docked)}/{cap}): {listed}")
     posture = station["posture"]
     if posture == "offensive":
         lines.append(f"Posture: offensive ({station['engage_pct']}% of fighters engage)")
@@ -75,6 +86,11 @@ def build_station_menu(station):
     lines.append("  4) Set posture (defensive/offensive)")
     if station["level"] < STATION_MAX_LEVEL and station["upgrade_to"] is None:
         lines.append(f"  5) Upgrade to Lvl {station['level'] + 1}")
+    docked = get_ships_docked_at_station(station["id"])
+    cap = station_dock_capacity(station["level"])
+    lines.append(f"  6) Dock a spare ship ({len(docked)}/{cap} bays used)")
+    if docked:
+        lines.append("  7) Undock a ship")
     lines.append("Reply with a number, or 'exit'.")
     return "\n".join(lines)
 
@@ -133,7 +149,8 @@ async def cmd_station_step(ctx, message):
     Advance an in-progress station visit (PENDING_STATIONS). Like the
     Stardock, it's menu-driven and open-ended: each action returns to the
     menu until the player replies 'exit'/'cancel'. Stages: "menu",
-    "transfer_qty", "posture_choose", "posture_pct", "upgrade_confirm".
+    "transfer_qty", "posture_choose", "posture_pct", "upgrade_confirm",
+    "dock_choose", "undock_choose".
     """
     pubkey = ctx.pubkey
     text = message.strip()
@@ -166,6 +183,10 @@ async def cmd_station_step(ctx, message):
         return _handle_posture_pct(ctx, state, station, p, text)
     if stage == "upgrade_confirm":
         return _handle_upgrade_confirm(ctx, state, station, p, lower)
+    if stage == "dock_choose":
+        return _handle_dock_choose(ctx, state, station, p, lower)
+    if stage == "undock_choose":
+        return _handle_undock_choose(ctx, state, station, p, lower)
 
     # Unknown stage -- reset to the menu defensively.
     state["stage"] = "menu"
@@ -198,6 +219,10 @@ def _handle_menu_choice(ctx, state, station, p, text):
         return "Set posture: reply 'd' for defensive or 'o' for offensive ('cancel' to go back)."
     if text == "5":
         return _begin_upgrade(state, station, p)
+    if text == "6":
+        return _begin_dock(state, station, p)
+    if text == "7":
+        return _begin_undock(state, station, p)
     return "Reply with a number, or 'exit'." + _menu(station)
 
 
@@ -328,3 +353,164 @@ def _handle_upgrade_confirm(ctx, state, station, p, lower):
         f"Paid {spec['credits']}cr and drew the materials from the stockpile."
         + _menu(get_station(station["id"]))
     )
+
+
+def _dock_bay_room(station):
+    """(docked_count, capacity, room) for the station's bays."""
+    docked = get_ships_docked_at_station(station["id"])
+    cap = station_dock_capacity(station["level"])
+    return len(docked), cap, cap - len(docked)
+
+
+def _own_spares_in_sector(p):
+    """The player's own unmanned ships sitting out in the open in their
+    current sector -- the dockable candidates. (Docked ships are already
+    excluded by get_parked_ships_in_sector itself.)"""
+    return [s for s in get_parked_ships_in_sector(p["sector_id"])
+            if s["owner_id"] == p["id"]]
+
+
+def _begin_dock(state, station, p):
+    used, cap, room = _dock_bay_room(station)
+    if room <= 0:
+        return f"Docking bays are full ({used}/{cap})." + _menu(station)
+    spares = _own_spares_in_sector(p)
+    if not spares:
+        return ("No spare ships of yours out in this sector to dock."
+                + _menu(station))
+    state["stage"] = "dock_choose"
+    state["queue"] = spares
+    state["idx"] = 0
+    return _dock_prompt(spares, 0, room)
+
+
+def _dock_prompt(queue, idx, room):
+    ship = queue[idx]
+    extras = []
+    if idx + 1 < len(queue):
+        extras.append("no = next ship")
+    if len(queue) > 1 and room > 1:
+        extras.append(f"'all' docks up to {room}")
+    suffix = f" ({', '.join(extras)})" if extras else ""
+    return f"Dock your {ship['ship_type']} #{ship['id']}? yes/no{suffix}"
+
+
+def _handle_dock_choose(ctx, state, station, p, lower):
+    queue, idx = state["queue"], state["idx"]
+    used, cap, room = _dock_bay_room(station)
+
+    if lower in ("cancel", "0"):
+        state["stage"] = "menu"
+        return "Docking cancelled." + _menu(station)
+
+    if lower in ("n", "no"):
+        idx += 1
+        if idx >= len(queue):
+            state["stage"] = "menu"
+            return "No more spare ships here." + _menu(station)
+        state["idx"] = idx
+        return _dock_prompt(queue, idx, room)
+
+    if lower == "all":
+        docked_now = []
+        for ship in queue[idx:]:
+            if room <= 0:
+                break
+            if _dock_one(ship, station, p):
+                docked_now.append(f"{ship['ship_type']} #{ship['id']}")
+                room -= 1
+        state["stage"] = "menu"
+        if not docked_now:
+            return "Nothing docked." + _menu(get_station(station["id"]))
+        note = " Bays are now full." if room <= 0 else ""
+        return (f"Docked {', '.join(docked_now)} at the station.{note}"
+                + _menu(get_station(station["id"])))
+
+    if lower in ("y", "yes"):
+        ship = queue[idx]
+        if room <= 0:
+            state["stage"] = "menu"
+            return f"Docking bays are full ({used}/{cap})." + _menu(station)
+        if not _dock_one(ship, station, p):
+            state["stage"] = "menu"
+            return "That ship is no longer here." + _menu(station)
+        docked_line = (f"Docked your {ship['ship_type']} #{ship['id']} -- it's "
+                       "sheltered from attack while the station stands.")
+        idx += 1
+        room -= 1
+        if idx >= len(queue) or room <= 0:
+            state["stage"] = "menu"
+            return docked_line + _menu(get_station(station["id"]))
+        state["idx"] = idx
+        return docked_line + "\n" + _dock_prompt(queue, idx, room)
+
+    return "Reply 'yes' to dock it, 'no' for the next ship, 'all', or 'cancel'."
+
+
+def _dock_one(ship, station, p):
+    """Re-validate and dock a single spare; False if it's no longer a
+    dockable candidate (moved, sold, destroyed, or already docked)."""
+    live = get_ship(ship["id"])
+    if (live is None or live["owner_id"] != p["id"]
+            or live["sector_id"] != station["sector_id"]
+            or live.get("docked_station_id") is not None):
+        return False
+    dock_ship_at_station(ship["id"], station["id"])
+    return True
+
+
+def _begin_undock(state, station, p):
+    docked = get_ships_docked_at_station(station["id"])
+    if not docked:
+        return "No ships are docked here." + _menu(station)
+    state["stage"] = "undock_choose"
+    state["queue"] = docked
+    state["idx"] = 0
+    return _undock_prompt(docked, 0)
+
+
+def _undock_prompt(queue, idx):
+    ship = queue[idx]
+    extras = ["no = next ship"] if idx + 1 < len(queue) else []
+    if len(queue) > 1:
+        extras.append("'all' undocks every ship")
+    suffix = f" ({', '.join(extras)})" if extras else ""
+    return f"Undock your {ship['ship_type']} #{ship['id']}? yes/no{suffix}"
+
+
+def _handle_undock_choose(ctx, state, station, p, lower):
+    queue, idx = state["queue"], state["idx"]
+
+    if lower in ("cancel", "0"):
+        state["stage"] = "menu"
+        return "Undocking cancelled." + _menu(station)
+
+    if lower in ("n", "no"):
+        idx += 1
+        if idx >= len(queue):
+            state["stage"] = "menu"
+            return "No more docked ships." + _menu(station)
+        state["idx"] = idx
+        return _undock_prompt(queue, idx)
+
+    if lower == "all":
+        for ship in queue[idx:]:
+            undock_ship(ship["id"])
+        names = ", ".join(f"{s['ship_type']} #{s['id']}" for s in queue[idx:])
+        state["stage"] = "menu"
+        return (f"Undocked {names} -- parked out in Sec{station['sector_id']} "
+                "(attackable again)." + _menu(get_station(station["id"])))
+
+    if lower in ("y", "yes"):
+        ship = queue[idx]
+        undock_ship(ship["id"])
+        line = (f"Undocked your {ship['ship_type']} #{ship['id']} -- parked out in "
+                f"Sec{station['sector_id']} (attackable again).")
+        idx += 1
+        if idx >= len(queue):
+            state["stage"] = "menu"
+            return line + _menu(get_station(station["id"]))
+        state["idx"] = idx
+        return line + "\n" + _undock_prompt(queue, idx)
+
+    return "Reply 'yes' to undock it, 'no' for the next ship, 'all', or 'cancel'."

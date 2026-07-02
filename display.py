@@ -6,6 +6,7 @@ see: sector info, the per-sector port/warps lines, and the command menu.
 from db import (
     get_port, get_adjacent_sectors, get_players_in_sector,
     get_station_in_sector, get_parked_ships_in_sector,
+    get_ships_docked_at_station,
 )
 
 from core import COMMANDS, ship_label
@@ -98,4 +99,12 @@ def build_sector_info(sector_id, viewer_id=None):
         lines.append(
             f"Space Station - {station['owner_name']} ({station['fighters']} ftr)"
         )
+        # Spares sheltering inside the station's docking bays -- visible
+        # to everyone (you can see them through the bay doors) but not
+        # attackable, towable, or boardable until undocked. They go down
+        # with the station if it's destroyed.
+        docked = get_ships_docked_at_station(station["id"])
+        if docked:
+            listed = ", ".join(ship_label(s) for s in docked)
+            lines.append("Docked: " + listed)
     return "\n".join(lines)

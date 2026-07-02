@@ -522,6 +522,79 @@ class MultiShipDbTests(unittest.TestCase):
         self.assertEqual(self._fresh()["turns_remaining"], 0)   # clamped
 
 
+class StationDockingDbTests(unittest.TestCase):
+    """Docking bays against a real db: dock/undock bookkeeping, the
+    parked-ships exclusion that shelters docked hulls, capacity math, and
+    delete_station taking its docked ships down with it."""
+
+    def setUp(self):
+        db.DB_PATH = os.path.join(tempfile.mkdtemp(), "dock.db")
+        db.init_db()
+        conn = db.get_connection()
+        conn.executemany(
+            "INSERT INTO sectors (id) VALUES (?)", [(i,) for i in range(1, 25)]
+        )
+        conn.commit()
+        conn.close()
+        self.player = db.create_player("pk", "Alice")
+        # Park the starter Falcon in Sec20 and fly a Kestrel.
+        self.spare_id = db.get_player_with_ship("pk")["ship_id"]
+        db.park_and_buy_ship(self.player["id"], 20, "Kestrel", 15, 20, 20, 0, 0)
+        self.station = db.create_station(self.player["id"], "Alice", 20)
+
+    def test_dock_capacity_is_two_per_level(self):
+        self.assertEqual(db.station_dock_capacity(1), 2)
+        self.assertEqual(db.station_dock_capacity(2), 4)
+        self.assertEqual(db.station_dock_capacity(3), 6)
+        self.assertEqual(db.station_dock_capacity(4), 8)
+
+    def test_docking_hides_a_ship_from_the_parked_query(self):
+        self.assertEqual(
+            [s["id"] for s in db.get_parked_ships_in_sector(20)], [self.spare_id]
+        )
+
+        db.dock_ship_at_station(self.spare_id, self.station["id"])
+
+        self.assertEqual(db.get_parked_ships_in_sector(20), [])   # sheltered
+        docked = db.get_ships_docked_at_station(self.station["id"])
+        self.assertEqual([s["id"] for s in docked], [self.spare_id])
+        self.assertEqual(docked[0]["owner_name"], "Alice")
+
+    def test_undocking_returns_it_to_the_open(self):
+        db.dock_ship_at_station(self.spare_id, self.station["id"])
+        db.undock_ship(self.spare_id)
+        self.assertEqual(
+            [s["id"] for s in db.get_parked_ships_in_sector(20)], [self.spare_id]
+        )
+        self.assertEqual(db.get_ships_docked_at_station(self.station["id"]), [])
+
+    def test_docking_releases_a_tow_on_the_hull(self):
+        db.set_towing(self.player["id"], self.spare_id)
+        db.dock_ship_at_station(self.spare_id, self.station["id"])
+        self.assertIsNone(db.get_player_with_ship("pk")["towing_ship_id"])
+
+    def test_delete_station_destroys_the_ships_docked_inside(self):
+        db.dock_ship_at_station(self.spare_id, self.station["id"])
+
+        db.delete_station(self.station["id"])
+
+        self.assertIsNone(db.get_ship(self.spare_id))          # gone with it
+        self.assertIsNone(db.get_station(self.station["id"]))
+        conn = db.get_connection()
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM ships WHERE player_id = ?", (self.player["id"],)
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(remaining, 1)                          # just the active Kestrel
+
+    def test_delete_station_spares_undocked_ships(self):
+        db.delete_station(self.station["id"])                   # spare never docked
+        self.assertIsNotNone(db.get_ship(self.spare_id))
+        self.assertEqual(
+            [s["id"] for s in db.get_parked_ships_in_sector(20)], [self.spare_id]
+        )
+
+
 class PortRestockTests(unittest.TestCase):
     """apply_port_restock against a real db: proportional drift of stock
     toward each commodity's starting level (selling up to capacity, buying
