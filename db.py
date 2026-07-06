@@ -339,6 +339,23 @@ DAILY_TURNS = 100
 # at the Stardock (HOME_SECTOR) and need a safe runway to get going.
 SAFE_ZONE_MAX_SECTOR = 10
 
+# Valid sector id range. MAX_SECTOR_ID matches galaxy.py's NUM_SECTORS;
+# movement and probe targeting both validate against these.
+MIN_SECTOR_ID = 1
+MAX_SECTOR_ID = 1000
+
+# When a pilot already in an escape pod is finished off (by combat or
+# mines), they don't just lose the pod -- they're wiped back to a fresh
+# start: a default-hull ship at the home sector with their credits reset
+# to this amount.
+POD_KILL_RESET_CREDITS = 20000
+
+# Dragging one of your own unmanned hulls behind you. Slow going: every
+# sector moved while towing burns this many turns instead of one, and a
+# move is refused outright when fewer remain (rather than burning the
+# player down to zero mid-haul).
+TOW_TURNS_PER_SECTOR = 5
+
 # Turns refill once a day at this hour, Eastern time. America/New_York
 # (rather than a fixed UTC offset) keeps "3am Eastern" correct through
 # daylight-saving changes.

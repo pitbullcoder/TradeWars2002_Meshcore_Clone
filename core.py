@@ -72,6 +72,45 @@ def ship_label(ship):
     return f"{ship['owner_name']}'s {ship['ship_type']} #{ship['id']}"
 
 
+# The three cargo commodities, each with the argument aliases it accepts
+# in player replies. Order matches the fuel/organics/equipment order used
+# everywhere else (status, trading, jettison, p2p). The Station Core kit
+# is deliberately NOT here -- it's a STATION_CORE_PRICE-cr fixture
+# offloaded by deploying or selling it, never handled as loose cargo.
+_JETTISON_COMMODITIES = [
+    ("fuel ore", "fuel_ore", ("fuel", "fuel_ore", "ore")),
+    ("organics", "organics", ("organics", "org")),
+    ("equipment", "equipment", ("equipment", "equip")),
+]
+
+
+def _resolve_commodity(arg):
+    """Map a commodity argument to its (label, ship column), or None if it
+    doesn't name one of the three cargo commodities."""
+    arg = arg.lower()
+    for label, key, aliases in _JETTISON_COMMODITIES:
+        if arg in aliases:
+            return label, key
+    return None
+
+
+def _commodity_label(key):
+    for label, k, _ in _JETTISON_COMMODITIES:
+        if k == key:
+            return label
+    return key
+
+
+def _commodity_token(key):
+    """The short reply token for a commodity ('fuel'/'organics'/
+    'equipment') -- its first jettison alias, which _resolve_commodity
+    also accepts."""
+    for _, k, aliases in _JETTISON_COMMODITIES:
+        if k == key:
+            return aliases[0]
+    return key
+
+
 # Map of command -> (description, async handler(ctx, args) -> str)
 COMMANDS = {}
 

@@ -484,11 +484,14 @@ The game is split into focused modules:
 
 | Module | Responsibility |
 |--------|----------------|
-| `main.py` | Entry point, radio wiring, command handlers, sign-in flow. |
+| `main.py` | Entry point: radio wiring, command dispatch, sign-in flow, channel adverts. |
 | `core.py` | Shared game state, the command registry, and the message context. |
 | `db.py` | SQLite schema, all persistence, and the game-balance constants. |
 | `galaxy.py` | One-time generation of sectors, warps, and ports. |
 | `trading.py` | Port trading and the Stardock refit / shipyard / Station Core flows. |
+| `movement.py` | Arrival and relocation: move, multi-hop warps, tow, board, `enter_sector`. |
+| `attack.py` | Combat & recon command handlers: laying mines, probes, the attack flow. |
+| `p2p.py` | The port-to-port auto-shuttle. |
 | `station.py` | Deploying and managing player-built space stations. |
 | `combat.py` | Pure combat & mine-damage math (no database access). |
 | `pathfinding.py` | Warp-graph routing and escape-pod placement. |

@@ -108,3 +108,59 @@ def build_sector_info(sector_id, viewer_id=None):
             listed = ", ".join(ship_label(s) for s in docked)
             lines.append("Docked: " + listed)
     return "\n".join(lines)
+
+
+# --- Public kill log --------------------------------------------------
+# At most this many kill-log entries are shown at sign-in (the most recent
+# ones), with a one-line note counting any older kills not shown. The log
+# covers "everything since you last played", which over a busy stretch
+# could be a lot -- this keeps the sign-in briefing from flooding a slow
+# radio link while still surfacing the full count.
+KILL_LOG_MAX_ENTRIES = 20
+
+
+def format_attack_notices(events):
+    """Turn queued attack_events (oldest first) into the sign-in briefing a
+    victim sees -- one line each, phrased by outcome, tagged with when."""
+    phrasing = {
+        "attacked": "{who} attacked you in Sec{sec}",
+        "destroyed": "{who} destroyed your ship in Sec{sec}; you ejected in a pod",
+        "pod_destroyed": "{who} blew up your escape pod in Sec{sec}; you were reset",
+        "station_destroyed": "{who} destroyed your space station in Sec{sec}",
+        "unmanned_attacked": "{who} attacked your unmanned ship in Sec{sec}",
+        "unmanned_destroyed": "{who} destroyed your unmanned ship in Sec{sec}",
+    }
+    lines = ["While you were away:"]
+    for e in events:
+        what = phrasing.get(e["outcome"], "{who} attacked you in Sec{sec}").format(
+            who=e["attacker_name"], sec=e["sector_id"]
+        )
+        when = e["created_at"][:16].replace("T", " ")  # YYYY-MM-DD HH:MM, UTC
+        lines.append(f"- {what} ({when} UTC).")
+    return "\n".join(lines)
+
+
+def _format_one_kill(k):
+    """One public kill-log line: '<killer> destroyed/wiped <victim>'s
+    ship/escape pod in SecN (time UTC)'. A None killer means mines."""
+    when = k["created_at"][:16].replace("T", " ")  # YYYY-MM-DD HH:MM, UTC
+    killer = k["killer_name"] or "Mines"
+    if k["kind"] == "pod":
+        return f"{killer} wiped {k['victim_name']}'s escape pod in Sec{k['sector_id']} ({when} UTC)"
+    return f"{killer} destroyed {k['victim_name']}'s ship in Sec{k['sector_id']} ({when} UTC)"
+
+
+def format_kill_log(kills):
+    """Render the public kill log shown at sign-in: one line per kill,
+    oldest first. Returns "" for an empty list (so no section is shown at
+    all). If there are more than KILL_LOG_MAX_ENTRIES, only the most recent
+    that many are listed, with a leading note counting the older ones."""
+    if not kills:
+        return ""
+    omitted = max(0, len(kills) - KILL_LOG_MAX_ENTRIES)
+    shown = kills[-KILL_LOG_MAX_ENTRIES:] if omitted else kills
+    lines = ["Kills since you last played:"]
+    if omitted:
+        lines.append(f"(+{omitted} earlier not shown)")
+    lines.extend("- " + _format_one_kill(k) for k in shown)
+    return "\n".join(lines)

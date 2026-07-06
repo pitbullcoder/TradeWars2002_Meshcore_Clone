@@ -622,6 +622,10 @@ ESCAPE_POD_SHIP = "Escape Pod"
 SHIP_RESALE_FRACTION = 0.5
 HOME_SECTOR = 1
 SAFE_ZONE_MAX_SECTOR = 10
+MIN_SECTOR_ID = 1
+MAX_SECTOR_ID = 1000
+POD_KILL_RESET_CREDITS = 20000
+TOW_TURNS_PER_SECTOR = 5
 
 # Station constants/helpers mirrored from db (pure -- no persistence).
 STATION_CORE_PRICE = 5_000_000
@@ -836,6 +840,10 @@ def _install_stub_modules():
     db_stub.ESCAPE_POD_SHIP = ESCAPE_POD_SHIP
     db_stub.HOME_SECTOR = HOME_SECTOR
     db_stub.SAFE_ZONE_MAX_SECTOR = SAFE_ZONE_MAX_SECTOR
+    db_stub.MIN_SECTOR_ID = MIN_SECTOR_ID
+    db_stub.MAX_SECTOR_ID = MAX_SECTOR_ID
+    db_stub.POD_KILL_RESET_CREDITS = POD_KILL_RESET_CREDITS
+    db_stub.TOW_TURNS_PER_SECTOR = TOW_TURNS_PER_SECTOR
     db_stub.set_ship_station_core = _stub_set_ship_station_core
     db_stub.set_ship_cargo = _stub_set_ship_cargo
     db_stub.adjust_player_credits = _stub_adjust_player_credits
@@ -876,6 +884,8 @@ def _install_stub_modules():
 
 _install_stub_modules()
 import main  # noqa: E402  (must come after the stubs are installed)
+import attack  # noqa: E402  (rng seam for combat knockback -- attack.random)
+import movement  # noqa: E402  (rng seam for mines/pod drift -- movement.random)
 
 
 class FakeCtx:
@@ -1813,11 +1823,13 @@ class MinesRefitTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FakeRandom:
-    """Deterministic stand-in for the `random` module that main uses.
-    `randints` is a queue popped by randint() (falling back to the high
-    end once exhausted); choice() returns the element at `choice_index`.
-    Install per-test with `main.random = FakeRandom(...)` after setUp's
-    reload has restored the real module."""
+    """Deterministic stand-in for the `random` module the feature modules
+    use. `randints` is a queue popped by randint() (falling back to the
+    high end once exhausted); choice() returns the element at
+    `choice_index`. Install per-test with `movement.random = FakeRandom(...)`
+    (mine damage, pod drift) or `attack.random = FakeRandom(...)` (combat
+    knockback) after setUp's reload(main) has restored the real module in
+    both."""
 
     def __init__(self, randints=None, choice_index=0):
         self.randints = list(randints or [])
@@ -2386,7 +2398,7 @@ class P2PCommandTests(unittest.IsolatedAsyncioTestCase):
                                        organics=75, shields=50, fighters=0,
                                        credits=100000, turns_remaining=10)
         STATE["sector_mines"] = {101: {2: 1}}      # someone else's mine
-        main.random = FakeRandom([3])              # 3 damage, survivable
+        movement.random = FakeRandom([3])          # 3 damage, survivable
         await self.p2p("101")
         msg = await self.step("organics")
         self.assertIn("detonate", msg)
@@ -2421,7 +2433,7 @@ class P2PCommandTests(unittest.IsolatedAsyncioTestCase):
                                        organics=75, shields=0, fighters=0,
                                        credits=100000, turns_remaining=10)
         STATE["sector_mines"] = {101: {2: 1}}
-        main.random = FakeRandom([10])             # lethal to a 0/0 ship
+        movement.random = FakeRandom([10])         # lethal to a 0/0 ship
         await self.p2p("101")
         msg = await self.step("organics")
         self.assertIn("DESTROYED", msg)
@@ -2562,7 +2574,7 @@ class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
         STATE["player"] = fresh_player(id=1, sector_id=12, ship_type="Bismark",
                                        shields=20, fighters=10)
         STATE["sector_mines"] = {13: {2: 2}}   # player 2 laid 2 mines
-        main.random = FakeRandom([5, 4])        # 9 total damage
+        movement.random = FakeRandom([5, 4])    # 9 total damage
 
         prompt = await main.cmd_move(self.ctx(), "13")
 
@@ -2590,7 +2602,7 @@ class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
                                        shields=5, fighters=2,
                                        fuel_ore=10, organics=5, equipment=3)
         STATE["sector_mines"] = {13: {2: 10}}
-        main.random = FakeRandom([10] * 10)     # 100 damage -- lethal
+        movement.random = FakeRandom([10] * 10)  # 100 damage -- lethal
 
         prompt = await main.cmd_move(self.ctx(), "13")
 
@@ -2617,7 +2629,7 @@ class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
         STATE["player"] = fresh_player(id=1, sector_id=12, ship_type="Bismark",
                                        shields=0, fighters=0)
         STATE["sector_mines"] = {13: {2: 3}}
-        main.random = FakeRandom([10, 10, 10])
+        movement.random = FakeRandom([10, 10, 10])
 
         # Plot 12 -> 13 -> 14 -> 15; the first hop lands on the mines.
         prompt = await main.cmd_move(self.ctx(), "15")
@@ -2638,7 +2650,7 @@ class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
                                        shields=0, fighters=0, credits=8000)
         STATE["port"] = fresh_port("STARDOCK")    # so Sec1 renders as the Stardock
         STATE["sector_mines"] = {13: {2: 3}}
-        main.random = FakeRandom([10, 10, 10])    # any damage is lethal to a pod
+        movement.random = FakeRandom([10, 10, 10])  # any damage is lethal to a pod
 
         prompt = await main.cmd_move(self.ctx(), "13")
 
@@ -2661,7 +2673,7 @@ class MineDetonationTests(unittest.IsolatedAsyncioTestCase):
         STATE["player"] = fresh_player(id=1, sector_id=12, ship_type="Escape Pod",
                                        shields=0, fighters=0, credits=8000)
         STATE["sector_mines"] = {13: {2: 3}}
-        main.random = FakeRandom([10, 10, 10])
+        movement.random = FakeRandom([10, 10, 10])
 
         # Plot 12 -> 13 -> 14 -> 15; the first hop lands on the mines.
         prompt = await main.cmd_move(self.ctx(), "15")
@@ -3179,7 +3191,7 @@ class AttackCommandTests(unittest.IsolatedAsyncioTestCase):
         STATE["player"] = fresh_player(id=1, sector_id=15, fighters=2000, shields=10)
         STATE["players_by_id"] = {2: self._defender(ship_type="Bismark",
                                                     fighters=1000, shields=200, credits=5000)}
-        main.random = FakeRandom(choice_index=1)   # Sec15 adjacency [14, 16] -> pick 16
+        attack.random = FakeRandom(choice_index=1)  # Sec15 adjacency [14, 16] -> pick 16
 
         prompt = await self._aim_and_commit("Bob", "all")
 
@@ -3452,7 +3464,7 @@ class TurnCostTests(unittest.IsolatedAsyncioTestCase):
             "id": 2, "name": "Bob", "ship_type": "Bismark", "fighters": 10,
             "shields": 0, "sector_id": 5, "credits": 5000, "turns_remaining": 100,
         }}
-        main.random = FakeRandom(choice_index=0)
+        attack.random = FakeRandom(choice_index=0)
 
         await main.cmd_attack(self.ctx(), "Bob")
 
