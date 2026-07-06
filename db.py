@@ -657,7 +657,7 @@ STARDOCK_PRICES = {
     "holds_total": 500,
     "fighters": 50,
     "shields": 25,
-    "mines": 1,
+    "mines": 2500,
     "probes": 100,
 }
 
