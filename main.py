@@ -78,7 +78,9 @@ from core import (
     _JETTISON_COMMODITIES,
     _resolve_commodity,
 )
-from messaging import send_reply, send_channel_reply, is_stale_message
+from messaging import (
+    send_reply, send_channel_reply, is_stale_message, format_rx_path,
+)
 from display import (
     build_menu,
     build_submenu,
@@ -149,7 +151,14 @@ PUBLIC_CHANNEL_IDX = 0  # which channel index the bot listens to for public comm
 # the countdown rather than re-advertising early; a fresh install with no
 # prior broadcast advertises immediately. Kept under one radio chunk (130
 # chars) so the logged text matches ADVERT_TEXT exactly.
-ADVERT_TEXT = "TradeWars 2002 is ready to play, just submit a DM to play!"
+ADVERT_TEXT = "Tradewars 2002 is ready! Submit an advert flood routed then DM me to play!"
+
+
+# Master switch for the public channel ad. Set False to silence it
+# (advertise_loop keeps running but maybe_advertise sends nothing).
+# Since a disabled stretch logs no transmissions, flipping this back on
+# after 48+ quiet hours broadcasts on the next scheduler wake-up.
+ADVERT_ENABLED = True
 
 
 ADVERT_INTERVAL_SECONDS = 48 * 60 * 60  # once every 48 hours
@@ -177,6 +186,8 @@ async def maybe_advertise(mc):
     sent (send_channel_reply logs the transmission, which is what arms
     the next 48-hour countdown). Split out from advertise_loop so the
     decision + send is testable without an infinite loop."""
+    if not ADVERT_ENABLED:
+        return False
     if _seconds_until_next_advert() > 0:
         return False
     print("→ broadcasting channel advertisement")
@@ -405,8 +416,11 @@ async def on_message(mc, event):
     contact = mc.get_contact_by_key_prefix(pubkey)
     sender = contact["adv_name"] if contact else pubkey[:8]
 
-    print(f"RX from {sender}: {message}")
-    log_message("rx", pubkey, sender, message)
+    # Inbound DMs carry only a hop count (not the hop hashes), so this
+    # logs 'direct' / 'N hops', or None on firmware that omits it.
+    rx_path = format_rx_path(payload)
+    print(f"RX from {sender} [{rx_path or 'path unknown'}]: {message}")
+    log_message("rx", pubkey, sender, message, rx_path)
 
     player, is_new = get_or_create_player(pubkey, sender)
 
@@ -529,6 +543,16 @@ async def main():
     result = await mc.commands.get_contacts()
     if result.type == EventType.ERROR:
         print(f"Error getting contacts: {result.payload}")
+
+    # Refetch the contact list whenever the radio pushes a PATH_UPDATE
+    # (or a new advert). Off by default in meshcore_py, which leaves
+    # mc.contacts frozen at the startup snapshot above -- so radio_path
+    # would report a contact's route as it stood at boot (e.g. [flood]
+    # forever) even after the firmware learns a direct path, and
+    # send_msg_with_retry would keep applying flood retry limits to it.
+    # Refetches are incremental (lastmod-based) over the serial link, so
+    # this costs no radio airtime.
+    mc.auto_update_contacts = True
 
     await mc.start_auto_message_fetching()
 

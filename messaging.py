@@ -128,6 +128,82 @@ def is_stale_message(payload, max_age=MAX_MESSAGE_AGE_SECONDS):
     return (time.time() - sender_timestamp) > max_age
 
 
+def _hop_hashes(contact):
+    """The contact's stored outbound path as a list of raw one-byte hop
+    hashes ('a3', '7f', ...), one per repeater, in transmit order. The
+    firmware pads out_path to a fixed width, so only the first
+    out_path_len bytes are meaningful."""
+    n = contact.get("out_path_len", -1)
+    if n is None or n <= 0:
+        return []
+    hexstr = (contact.get("out_path") or "").lower()
+    return [hexstr[i * 2:i * 2 + 2] for i in range(n) if len(hexstr) >= i * 2 + 2]
+
+
+def _hop_name(mc, hop_hash):
+    """Best-effort repeater name for a one-byte hop hash: if exactly one
+    known contact's pubkey starts with that byte, its adv_name; otherwise
+    (no match, or two contacts sharing a first byte) the raw hash. Used
+    only for the console line -- the database always gets raw hashes."""
+    matches = [
+        c for c in getattr(mc, "contacts", {}).values()
+        if (c.get("public_key") or "").lower().startswith(hop_hash)
+    ]
+    if len(matches) == 1 and matches[0].get("adv_name"):
+        return matches[0]["adv_name"]
+    return hop_hash
+
+
+def radio_path(mc, pubkey):
+    """
+    Describe the radio's current outbound path to `pubkey` as
+    (db_text, console_text):
+
+        db_text       what's stored in the messages.path column --
+                      'direct', 'flood', or raw hop hashes 'a3>7f';
+                      None if the contact isn't known.
+        console_text  same, but with each hop hash swapped for the
+                      repeater's name when exactly one known contact
+                      matches it (ambiguous or unknown hashes stay raw).
+
+    Read *after* a chunk's delivery ACK, this reflects the route actually
+    used: send_msg_with_retry resets the stored path to flood when it
+    falls back, and the firmware updates it when a new path is learned.
+    Never raises -- path logging must not be able to break a reply.
+    """
+    try:
+        contact = mc.get_contact_by_key_prefix(pubkey)
+        if contact is None:
+            return None, "path unknown"
+        n = contact.get("out_path_len", -1)
+        if n is None or n < 0:
+            return "flood", "flood"
+        if n == 0:
+            return "direct", "direct"
+        hashes = _hop_hashes(contact)
+        db_text = ">".join(hashes)
+        console_text = ">".join(_hop_name(mc, h) for h in hashes)
+        return db_text, "via " + console_text
+    except Exception as e:  # pragma: no cover - defensive only
+        print(f"  (radio path lookup failed: {e})")
+        return None, "path unknown"
+
+
+def format_rx_path(payload):
+    """
+    The inbound counterpart for received DMs: the CONTACT_MSG_RECV
+    payload carries only a hop count (path_len; 255 or -1 hash mode
+    means direct), not the hop hashes themselves. Returns 'direct',
+    'N hop(s)', or None if the payload has no path info.
+    """
+    path_len = payload.get("path_len")
+    if path_len is None:
+        return None
+    if path_len == 255 or payload.get("path_hash_mode") == -1:
+        return "direct"
+    return f"{path_len} hop" if path_len == 1 else f"{path_len} hops"
+
+
 async def _send_chunk_acked(mc, pubkey, chunk):
     """
     Transmit one chunk and wait for its delivery ACK, with a second
@@ -175,8 +251,11 @@ async def send_reply(mc, pubkey, sender, text):
                 print(f"  Error sending reply (no ack received), dropping "
                       f"{len(chunks) - i - 1} remaining chunk(s): {chunk}")
                 return
-            print(f"  Reply sent + acked: {chunk}")
-            log_message("tx", pubkey, sender, chunk)
+            # Read the path *after* the ACK so any mid-chunk flood
+            # fallback or path update is what gets recorded.
+            db_path, console_path = radio_path(mc, pubkey)
+            print(f"  Reply sent + acked [{console_path}]: {chunk}")
+            log_message("tx", pubkey, sender, chunk, db_path)
             if i < len(chunks) - 1:
                 await asyncio.sleep(INTER_CHUNK_DELAY_SECONDS)
 

@@ -22,9 +22,19 @@ def init_db():
             pubkey_prefix TEXT,
             sender_name TEXT,
             text TEXT,
-            timestamp TEXT NOT NULL
+            timestamp TEXT NOT NULL,
+            path TEXT                 -- radio route: 'direct', 'flood',
+                                      -- hop hashes 'a3>7f', or NULL if
+                                      -- unknown/not applicable (rx before
+                                      -- this column, channel broadcasts)
         )
     """)
+
+    # Migration for databases created before the radio path was logged.
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN path TEXT")
+    except sqlite3.OperationalError:
+        pass  # already has the column
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sectors (
@@ -1708,11 +1718,16 @@ def get_last_tx_time(pubkey_prefix, text):
     return row[0]
 
 
-def log_message(direction, pubkey_prefix, sender_name, text):
+def log_message(direction, pubkey_prefix, sender_name, text, path=None):
+    """`path` is the radio route the message took, when known: 'direct',
+    'flood', a '>'-joined string of raw repeater hop hashes (e.g.
+    'a3>7f'), or 'N hops' for received messages (which carry only the
+    hop count). None when unknown or not applicable (channel
+    broadcasts)."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO messages (direction, pubkey_prefix, sender_name, text, timestamp) VALUES (?, ?, ?, ?, ?)",
-        (direction, pubkey_prefix, sender_name, text, datetime.now(timezone.utc).isoformat())
+        "INSERT INTO messages (direction, pubkey_prefix, sender_name, text, timestamp, path) VALUES (?, ?, ?, ?, ?, ?)",
+        (direction, pubkey_prefix, sender_name, text, datetime.now(timezone.utc).isoformat(), path)
     )
     conn.commit()
     conn.close()

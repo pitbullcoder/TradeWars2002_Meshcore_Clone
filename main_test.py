@@ -4693,7 +4693,7 @@ class AdvertiseTests(unittest.IsolatedAsyncioTestCase):
 
     def test_the_ad_fits_in_one_radio_chunk(self):
         self.assertLessEqual(len(main.ADVERT_TEXT), 130)
-        self.assertIn("TradeWars 2002 is ready to play", main.ADVERT_TEXT)
+        self.assertIn("Tradewars 2002 is ready", main.ADVERT_TEXT)
         self.assertIn("DM", main.ADVERT_TEXT)
 
     def test_due_immediately_when_never_advertised(self):
@@ -4727,6 +4727,18 @@ class AdvertiseTests(unittest.IsolatedAsyncioTestCase):
         sent = await main.maybe_advertise(mc)
         self.assertFalse(sent)
         self.assertEqual(mc.commands.sent, [])
+
+    async def test_disabled_switch_silences_an_otherwise_due_ad(self):
+        # Never advertised, so an ad is due -- but the switch wins, and
+        # nothing is transmitted or logged (leaving the countdown unarmed,
+        # so re-enabling broadcasts on the next wake-up). setUp's reload
+        # of main restores ADVERT_ENABLED = True for every other test.
+        main.ADVERT_ENABLED = False
+        mc = self._FakeMC()
+        sent = await main.maybe_advertise(mc)
+        self.assertFalse(sent)
+        self.assertEqual(mc.commands.sent, [])
+        self.assertEqual(STATE["last_tx_times"], {})
 
 
 if __name__ == "__main__":

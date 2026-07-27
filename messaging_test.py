@@ -131,8 +131,28 @@ class FakeCommands:
 
 
 class FakeMC:
+    """Also stands in for the MeshCore contact cache that radio_path
+    reads: `contacts` maps public_key -> contact dict, mirroring the real
+    mc.contacts property and get_contact_by_key_prefix lookup."""
+
     def __init__(self):
         self.commands = FakeCommands()
+        self.contacts = {}
+
+    def add_contact(self, public_key, adv_name, out_path="", out_path_len=-1):
+        self.contacts[public_key] = {
+            "public_key": public_key,
+            "adv_name": adv_name,
+            "out_path": out_path,
+            "out_path_len": out_path_len,
+        }
+
+    def get_contact_by_key_prefix(self, prefix):
+        prefix = prefix.lower()
+        for contact in self.contacts.values():
+            if contact["public_key"].lower().startswith(prefix):
+                return contact
+        return None
 
 
 class RecordingSleep:
@@ -250,7 +270,8 @@ class SendReplyTests(MessagingTestCase):
     def test_single_chunk_reply_is_sent_and_logged(self):
         run(messaging.send_reply(self.mc, "PK", "Tester", "hi"))
         self.assertEqual(self.tx_chunks(), ["hi"])
-        self.assertEqual(MESSAGE_LOG, [("tx", "PK", "Tester", "hi")])
+        # No contact configured for PK, so the logged path is None.
+        self.assertEqual(MESSAGE_LOG, [("tx", "PK", "Tester", "hi", None)])
 
     def test_every_chunk_waits_for_its_ack_before_the_next_transmits(self):
         text = self.multipart_text()
@@ -320,6 +341,71 @@ class SendReplyTests(MessagingTestCase):
         # any alternation means the TX lock failed to serialize them.
         self.assertEqual(pubkeys, [pubkeys[0]] * n + [pubkeys[n]] * n)
         self.assertNotEqual(pubkeys[0], pubkeys[n])
+
+
+class RadioPathTests(MessagingTestCase):
+    """radio_path's (db_text, console_text) formatting: raw hop hashes
+    always go to the db side; names appear on the console side only when
+    exactly one contact matches a hop hash."""
+
+    def test_unknown_contact_yields_none(self):
+        self.assertEqual(messaging.radio_path(self.mc, "PK"),
+                         (None, "path unknown"))
+
+    def test_direct_path(self):
+        self.mc.add_contact("aabbcc" + "0" * 58, "alice",
+                            out_path="", out_path_len=0)
+        self.assertEqual(messaging.radio_path(self.mc, "aabbcc"),
+                         ("direct", "direct"))
+
+    def test_flood_path(self):
+        self.mc.add_contact("aabbcc" + "0" * 58, "alice", out_path_len=-1)
+        self.assertEqual(messaging.radio_path(self.mc, "aabbcc"),
+                         ("flood", "flood"))
+
+    def test_hop_hashes_are_raw_in_db_and_named_on_console(self):
+        self.mc.add_contact("aabbcc" + "0" * 58, "alice",
+                            out_path="a37f", out_path_len=2)
+        # Exactly one contact starts with a3 -> named on console.
+        self.mc.add_contact("a3" + "1" * 62, "MtnRptr")
+        db_text, console_text = messaging.radio_path(self.mc, "aabbcc")
+        self.assertEqual(db_text, "a3>7f")           # raw hashes only
+        self.assertEqual(console_text, "via MtnRptr>7f")  # 7f has no match
+
+    def test_ambiguous_hop_hash_stays_raw_on_console(self):
+        self.mc.add_contact("aabbcc" + "0" * 58, "alice",
+                            out_path="a3", out_path_len=1)
+        self.mc.add_contact("a3" + "1" * 62, "RptrOne")
+        self.mc.add_contact("a3" + "2" * 62, "RptrTwo")
+        self.assertEqual(messaging.radio_path(self.mc, "aabbcc"),
+                         ("a3", "via a3"))
+
+    def test_padded_out_path_is_truncated_to_out_path_len(self):
+        # Firmware pads out_path; only the first out_path_len bytes count.
+        self.mc.add_contact("aabbcc" + "0" * 58, "alice",
+                            out_path="a37fdead", out_path_len=2)
+        self.assertEqual(messaging.radio_path(self.mc, "aabbcc")[0], "a3>7f")
+
+    def test_send_reply_logs_the_path_with_every_chunk(self):
+        self.mc.add_contact("PKAA" + "0" * 60, "alice",
+                            out_path="a37f", out_path_len=2)
+        text = self.multipart_text()
+        run(messaging.send_reply(self.mc, "PKAA", "alice", text))
+        self.assertTrue(MESSAGE_LOG)
+        for entry in MESSAGE_LOG:
+            self.assertEqual(entry[4], "a3>7f")
+
+    def test_format_rx_path(self):
+        self.assertIsNone(messaging.format_rx_path({}))
+        self.assertEqual(
+            messaging.format_rx_path({"path_len": 255, "path_hash_mode": -1}),
+            "direct")
+        self.assertEqual(
+            messaging.format_rx_path({"path_len": 1, "path_hash_mode": 0}),
+            "1 hop")
+        self.assertEqual(
+            messaging.format_rx_path({"path_len": 3, "path_hash_mode": 0}),
+            "3 hops")
 
 
 class SendChannelReplyTests(MessagingTestCase):
