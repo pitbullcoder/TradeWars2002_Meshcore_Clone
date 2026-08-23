@@ -1,6 +1,5 @@
 [Unit]
 Description=TradeWars 2002 MeshCore game bot
-Documentation=https://github.com/pitbullcoder/tradewars
 Wants=network-online.target
 # Ordering only -- After= does NOT wait for the companion TCP port to be
 # accepting connections, just for the unit to have been started. The
@@ -21,8 +20,8 @@ Group=pi
 # the database is created in whatever directory the process starts in.
 # Getting this wrong silently creates a second, empty galaxy instead of
 # failing -- every player would look brand new.
-WorkingDirectory=/opt/tradewars
-ExecStart=/opt/tradewars/venv/bin/python /opt/tradewars/main.py
+WorkingDirectory=/opt/TradeWars2002_Meshcore_Clone
+ExecStart=/opt/TradeWars2002_Meshcore_Clone/venv/bin/python /opt/TradeWars2002_Meshcore_Clone/main.py
 
 # The game logs with plain print(); without this, stdout is block-buffered
 # when piped to journald and console output arrives in delayed chunks --
