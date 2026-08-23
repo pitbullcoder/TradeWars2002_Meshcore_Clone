@@ -485,6 +485,128 @@ For an always-on node, a small **systemd** service that runs
 
 ---
 
+## Appendix: Pi Zero 2 W in a BQ Voyage Station G3
+
+A worked example of the whole stack on one device. The **Station G3** is a
+modular mesh enclosure that takes a compute module as its MCU
+daughterboard; a **Raspberry Pi Zero 2 W** (2×20 header soldered on) drops
+into that slot and drives the G3's SX1262 radio over SPI. The result is a
+Linux-native node that runs the repeater, the game, and any utility bots
+from a single board — no separate companion radio.
+
+### 1. Flash and reach the Pi
+
+Use Raspberry Pi Imager with **Raspberry Pi OS Lite (64-bit)** — the
+desktop image has no purpose here and the Zero 2 W has only 512 MB of RAM
+to spare. In Imager's advanced options set the hostname, enable SSH, and
+pre-fill your Wi-Fi credentials, so the board comes up headless with no
+monitor ever attached.
+
+Seat the Pi in the G3's daughterboard slot, power it, and connect:
+
+```bash
+ssh <user>@<hostname>.local
+```
+
+### 2. Install openHop Repeater
+
+openHop Repeater provides both the radio stack and the companion identity
+the game connects to. Follow the current install steps at
+<https://docs.openhop.dev/projects/openhop-repeater/installation/> —
+they're maintained against the active branch and change more often than
+this README does. Afterwards you'll have:
+
+| Path | What's there |
+| --- | --- |
+| `/etc/openhop_repeater/config.yaml` | main config |
+| `/var/lib/openhop_repeater` | runtime state |
+| `/opt/openhop_repeater` | application + virtualenv |
+| `journalctl -u openhop-repeater` | logs |
+
+Run the browser setup wizard and pick the **`bq-station-g3`** radio preset,
+which fills in the SX1262 pin map for this enclosure.
+
+> ⚠️ **The G3 preset sets `gpio_chip: 1`, which does not work on the Pi
+> Zero 2 W — it must be `0`.** The radio will fail to initialise until you
+> change it. Edit `/etc/openhop_repeater/config.yaml`, then
+> `sudo systemctl restart openhop-repeater` and watch
+> `journalctl -u openhop-repeater -f` for a clean radio bring-up.
+
+Confirm the node is actually on the air before going further: it should
+appear in another radio's contact list after it adverts.
+
+### 3. Add the game's companion identity
+
+Declare a companion for the game as described in **Companion connection**
+above, on a port nothing else uses. If you also run utility bots on this
+repeater, each needs its **own** identity and port — openHop serves one
+client per companion port, so they cannot share.
+
+### 4. Install and run the game
+
+Follow steps 2–5 of the setup section. Nothing about the game is
+Pi-specific; it connects to `127.0.0.1:5052` like it would anywhere.
+
+To start it on boot **after** the repeater is up, create
+`/etc/systemd/system/tradewars.service`:
+
+```ini
+[Unit]
+Description=TradeWars 2002 MeshCore game bot
+Wants=network-online.target
+After=network-online.target openhop-repeater.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/tradewars
+ExecStart=/opt/tradewars/venv/bin/python /opt/tradewars/main.py
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now tradewars
+journalctl -u tradewars -f
+```
+
+`After=` only orders startup; it does not wait for the companion port to
+be listening. That's what `Restart=on-failure` and `RestartSec=15` are
+for — if the game loses the race on a cold boot it exits and retries until
+the repeater is ready. The `auto_reconnect` setting in `main.py` covers
+the reverse case, where the repeater restarts underneath a running game.
+
+### Notes on this hardware
+
+**Memory is the real constraint.** 512 MB has to hold the repeater daemon,
+its web dashboard, the game, and anything else you've stacked on the node.
+Watch `free -h` and `journalctl -u tradewars` for OOM kills after adding
+each new service rather than piling them all on at once. A modest swap
+file helps absorb spikes, though leaning on swap on an SD card is a
+trade against card life.
+
+**SD cards die from writes.** The game writes to SQLite on every message
+and openHop persists packet history of its own. A good-quality card and
+periodic backups of `meshcore_messages.db` are worth the trouble — a
+corrupt database loses every player's progress.
+
+**Generating the galaxy is the heaviest thing this board will do.** Run
+`python galaxy.py` once and let it finish before starting the game; it
+builds a 1000-sector warp network and is noticeably slower here than on a
+desktop.
+
+**The radio is shared now.** Unlike a dedicated USB companion, this radio
+is also forwarding everyone else's mesh traffic. If multipart replies
+start dropping chunks under load, `INTER_CHUNK_DELAY_SECONDS` and
+`MIN_ACK_TIMEOUT_SECONDS` in `messaging.py` are the knobs — they were
+originally tuned against a companion that had the radio to itself.
+
+---
+
 ## Testing
 
 The project ships with unit and integration tests. The main suite stubs out

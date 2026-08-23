@@ -1,0 +1,50 @@
+[Unit]
+Description=TradeWars 2002 MeshCore game bot
+Documentation=https://github.com/pitbullcoder/tradewars
+Wants=network-online.target
+# Ordering only -- After= does NOT wait for the companion TCP port to be
+# accepting connections, just for the unit to have been started. The
+# Restart= settings below are what actually cover a cold-boot race.
+After=network-online.target openhop-repeater.service
+
+# Allow restarts indefinitely rather than giving up after systemd's
+# default burst limit. A repeater that takes a while to come up on a
+# cold boot should not permanently defeat the game.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+
+# Load-bearing: db.py opens "meshcore_messages.db" as a RELATIVE path, so
+# the database is created in whatever directory the process starts in.
+# Getting this wrong silently creates a second, empty galaxy instead of
+# failing -- every player would look brand new.
+WorkingDirectory=/opt/tradewars
+ExecStart=/opt/tradewars/venv/bin/python /opt/tradewars/main.py
+
+# The game logs with plain print(); without this, stdout is block-buffered
+# when piped to journald and console output arrives in delayed chunks --
+# which makes "journalctl -u tradewars -f" useless for watching a live
+# game session.
+Environment=PYTHONUNBUFFERED=1
+
+# Restart on any exit, not just failures. On a cold boot the companion
+# port may not be listening yet, so create_tcp() raises and the process
+# dies; this retries until openHop is ready. The auto_reconnect setting
+# in main.py handles the opposite case -- the repeater restarting
+# underneath an already-running game -- without a process restart.
+Restart=always
+RestartSec=15
+
+SyslogIdentifier=tradewars
+
+# Light hardening. Deliberately not ProtectSystem=strict or ProtectHome:
+# both are easy to get wrong on a node you are still iterating on, and a
+# game bot on a private mesh is not a meaningful attack surface.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
