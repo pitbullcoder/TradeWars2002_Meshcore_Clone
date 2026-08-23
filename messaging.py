@@ -280,6 +280,30 @@ async def send_reply(mc, pubkey, sender, text):
                 await asyncio.sleep(INTER_CHUNK_DELAY_SECONDS)
 
 
+async def send_self_advert(mc, flood=True):
+    """
+    Transmit a self-advert packet: the node announcing its own name and
+    public key, which is what puts the game in other radios' contact
+    lists so players can DM it at all. Distinct from the public-channel
+    invitation (send_channel_reply with ADVERT_TEXT), which is prose
+    telling people the game exists -- players need both.
+
+    flood=True routes through repeaters so the whole mesh hears it;
+    flood=False is zero-hop, reaching only radios in direct range.
+
+    Held under _TX_LOCK like every other outbound path, so an advert
+    can't land between two chunks of a multipart reply in progress.
+    Returns True if the companion accepted the advert for transmission.
+    """
+    async with _TX_LOCK:
+        result = await mc.commands.send_advert(flood=flood)
+        if result.type == EventType.ERROR:
+            print(f"  Error sending self-advert: {result.payload}")
+            return False
+        print(f"  Self-advert sent ({'flood' if flood else 'zero-hop'})")
+        return True
+
+
 async def send_channel_reply(mc, channel_idx, text):
     """
     Broadcast a reply to everyone on the given channel (not a private

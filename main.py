@@ -80,6 +80,7 @@ from core import (
 )
 from messaging import (
     send_reply, send_channel_reply, is_stale_message, format_rx_path,
+    send_self_advert,
 )
 from display import (
     build_menu,
@@ -221,6 +222,70 @@ async def advertise_loop(mc):
     while True:
         await maybe_advertise(mc)
         await asyncio.sleep(ADVERT_CHECK_INTERVAL_SECONDS)
+
+
+# --- Self-advert ---------------------------------------------------------
+# A self-advert packet announces the node's name and public key, which is
+# what gets the game into other radios' contact lists so players can DM
+# it. Separate from ADVERT_TEXT above: that's prose on the public channel
+# telling people the game exists, this is the addressing that makes it
+# reachable. Sent flood-routed so the whole mesh hears it, not just
+# radios in direct range.
+SELF_ADVERT_INTERVAL_SECONDS = 6 * 60 * 60
+
+
+# Floor on the gap between self-adverts, enforced against the messages
+# log rather than in-process state. The systemd unit restarts the game on
+# any exit, so a crash loop would otherwise flood-advertise every few
+# seconds -- antisocial on a shared mesh, and exactly the kind of thing
+# that's invisible from this end. A normal restart is minutes or more
+# apart and still re-advertises immediately, which is the useful part.
+SELF_ADVERT_MIN_GAP_SECONDS = 10 * 60
+
+
+# What a sent self-advert is logged as. Not a real message body -- it
+# just has to be a stable string so get_last_tx_time can find the last
+# one. Paired with pubkey_prefix "self" so it can't collide with a DM.
+SELF_ADVERT_LOG_TEXT = "<flood self-advert>"
+
+
+def _seconds_since_last_self_advert():
+    """Seconds since the last self-advert was transmitted, or None if
+    there's no record of one (fresh install, or a database predating
+    self-advert logging)."""
+    last = get_last_tx_time("self", SELF_ADVERT_LOG_TEXT)
+    if last is None:
+        return None
+    return time.time() - datetime.fromisoformat(last).timestamp()
+
+
+async def maybe_self_advert(mc):
+    """Flood-advertise unless one went out within the last
+    SELF_ADVERT_MIN_GAP_SECONDS. Returns True if sent. Only a successful
+    transmission is logged, so a failure is retried on the next pass
+    rather than arming the countdown. Split out from self_advert_loop so
+    the decision + send is testable without an infinite loop."""
+    since = _seconds_since_last_self_advert()
+    if since is not None and since < SELF_ADVERT_MIN_GAP_SECONDS:
+        print(f"→ skipping self-advert, last one {since:.0f}s ago")
+        return False
+    print("→ sending flood self-advert")
+    if not await send_self_advert(mc, flood=True):
+        return False
+    log_message("tx", "self", "advert", SELF_ADVERT_LOG_TEXT)
+    return True
+
+
+async def self_advert_loop(mc):
+    """Background task: advertise once at startup, then every
+    SELF_ADVERT_INTERVAL_SECONDS. Unlike the channel ad this doesn't
+    resume a countdown across restarts -- re-announcing on startup is
+    the point, so players find the game again after a reboot or a move.
+    SELF_ADVERT_MIN_GAP_SECONDS is what keeps that from becoming a flood
+    if the process is restart-looping."""
+    while True:
+        await maybe_self_advert(mc)
+        await asyncio.sleep(SELF_ADVERT_INTERVAL_SECONDS)
 
 
 # Matches anything that *looks* like a number a player might type as a
@@ -590,6 +655,7 @@ async def main():
 
     asyncio.create_task(monitor_inactivity(mc))
     asyncio.create_task(advertise_loop(mc))
+    asyncio.create_task(self_advert_loop(mc))
 
     print("Bot is running...")
     while True:
