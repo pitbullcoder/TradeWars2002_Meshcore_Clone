@@ -407,6 +407,33 @@ class RadioPathTests(MessagingTestCase):
             messaging.format_rx_path({"path_len": 3, "path_hash_mode": 0}),
             "3 hops")
 
+    def test_format_rx_path_treats_zero_hops_as_unknown(self):
+        """openHop's companion hardcodes path_len 0 on inbound DMs, so a
+        0 can't be told apart from a genuine zero-hop DM. Report unknown
+        rather than logging '0 hops' for every message the game ever
+        receives."""
+        self.assertIsNone(
+            messaging.format_rx_path({"path_len": 0, "path_hash_mode": 0}))
+
+    def test_format_rx_path_zero_still_direct_when_hash_mode_says_so(self):
+        """The direct check runs first: a payload that explicitly marks
+        itself direct is reported as such even with path_len 0."""
+        self.assertEqual(
+            messaging.format_rx_path({"path_len": 0, "path_hash_mode": -1}),
+            "direct")
+
+    def test_format_rx_path_zero_believed_when_trusted(self):
+        """Flipping TRUST_ZERO_RX_PATH_LEN restores the firmware reading,
+        where 0 is a real hop count."""
+        original = messaging.TRUST_ZERO_RX_PATH_LEN
+        messaging.TRUST_ZERO_RX_PATH_LEN = True
+        try:
+            self.assertEqual(
+                messaging.format_rx_path({"path_len": 0, "path_hash_mode": 0}),
+                "0 hops")
+        finally:
+            messaging.TRUST_ZERO_RX_PATH_LEN = original
+
 
 class SendChannelReplyTests(MessagingTestCase):
     def test_multipart_broadcast_sends_every_chunk_in_order(self):

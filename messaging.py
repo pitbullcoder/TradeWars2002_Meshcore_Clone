@@ -45,6 +45,21 @@ INTER_CHUNK_DELAY_SECONDS = 1.0
 FAILED_CHUNK_RETRY_DELAY_SECONDS = 3.0
 
 
+# Whether a received DM reporting path_len == 0 should be believed.
+#
+# Firmware reports a genuine 0 for a DM heard with no repeater in
+# between. openHop's companion frame server hardcodes path_len to 0 on
+# inbound DMs -- its channel-message callbacks pass the real value, the
+# direct-message one does not -- so under openHop a 0 means "not
+# reported", not "zero hops". Nothing in the payload distinguishes the
+# two cases, so with this off a 0 is reported as unknown: logging
+# 'path unknown' is honest, while writing "0 hops" into messages.path
+# for every inbound DM would quietly fill the column with a wrong
+# constant. Flip this on when running against a companion that reports
+# inbound DM path_len faithfully.
+TRUST_ZERO_RX_PATH_LEN = False
+
+
 # Serializes every outbound transmission -- multipart replies, channel
 # adverts, inactivity warnings -- so no two senders ever interleave on
 # the radio. Replies, the advert loop, and the inactivity monitor all
@@ -194,13 +209,18 @@ def format_rx_path(payload):
     The inbound counterpart for received DMs: the CONTACT_MSG_RECV
     payload carries only a hop count (path_len; 255 or -1 hash mode
     means direct), not the hop hashes themselves. Returns 'direct',
-    'N hop(s)', or None if the payload has no path info.
+    'N hop(s)', or None when the path can't be determined -- either the
+    payload has no path info at all, or it reports an ambiguous 0 (see
+    TRUST_ZERO_RX_PATH_LEN). Callers treat None as 'path unknown' and
+    log a NULL path rather than guessing.
     """
     path_len = payload.get("path_len")
     if path_len is None:
         return None
     if path_len == 255 or payload.get("path_hash_mode") == -1:
         return "direct"
+    if path_len == 0 and not TRUST_ZERO_RX_PATH_LEN:
+        return None
     return f"{path_len} hop" if path_len == 1 else f"{path_len} hops"
 
 

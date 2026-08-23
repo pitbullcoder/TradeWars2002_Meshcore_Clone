@@ -366,30 +366,59 @@ Send these as direct messages to the game node.
 ### What you need
 
 * A **Raspberry Pi or Linux machine** (anything that runs Python 3.9+).
-* A **MeshCore radio** flashed with the **USB Companion** firmware,
-  connected to the host over USB.
+* A **MeshCore companion** for the bot to transmit through, either:
+  * a radio flashed with the **USB Companion** firmware, connected over
+    USB, or
+  * a **companion identity hosted by openHop Repeater** on the same
+    machine, which is what the default configuration expects.
 * **Python 3** with `venv`, and the **`meshcore`** Python package.
 
-### 1. Serial port & permissions
+### 1. Companion connection
 
-The bot connects to the radio over a USB serial device. By default it
-expects **`/dev/ttyACM0` at 115200 baud** (see the `MeshCore.create_serial`
-call near the bottom of `main.py`). Plug in the radio and confirm the device:
+By default the bot connects over TCP to a companion identity served by
+the local openHop Repeater daemon — see `COMPANION_HOST` /
+`COMPANION_PORT` near the top of `main.py`. openHop serves **one client
+per companion port**, so this port belongs to the game alone; other bots
+on the same repeater need their own identities on their own ports.
 
-```bash
-ls /dev/ttyACM* /dev/ttyUSB*    # find your radio's device node
+Declare the identity in `/etc/openhop_repeater/config.yaml`:
+
+```yaml
+identities:
+  companions:
+    - name: TradeWars Bot
+      type: companion
+      settings:
+        node_name: TradeWars Bot
+        tcp_port: 5052
+        bind_address: 127.0.0.1
 ```
 
-If it shows up as something other than `/dev/ttyACM0` (e.g. `/dev/ttyUSB0`),
-edit that line in `main.py` to match.
+Leave `identity_key` out and openHop generates one on first run. Treat
+that key as a private key — anyone holding it can impersonate the node
+on the mesh. Binding to `127.0.0.1` keeps the companion port off the
+LAN; use `0.0.0.0` only if the game runs on a different host.
 
-On most Linux distros / Raspberry Pi OS you also need permission to read the
-serial port. Add your user to the `dialout` group once, then log out and
-back in (or reboot):
+Restart and confirm the port is listening:
+
+```bash
+sudo systemctl restart openhop-repeater
+ss -ltnp | grep 5052
+```
+
+**Using a USB companion radio instead:** swap the `create_tcp` call in
+`main()` for `MeshCore.create_serial("/dev/ttyACM0", 115200)`, matching
+the device node from `ls /dev/ttyACM* /dev/ttyUSB*`. Reading a serial
+port also needs group permission — add your user to `dialout` once, then
+log out and back in:
 
 ```bash
 sudo usermod -aG dialout "$USER"
 ```
+
+Note that a USB companion reports a real hop count on inbound DMs, while
+openHop currently does not; see `TRUST_ZERO_RX_PATH_LEN` in
+`messaging.py` if you want received-path logging to reflect that.
 
 ### 2. Time zone data
 
@@ -433,7 +462,7 @@ source venv/bin/activate
 python main.py
 ```
 
-You should see `Connected OK` and then `Bot is running...`. The game now
+You should see `Connected OK (127.0.0.1:5052)` and then `Bot is running...`. The game now
 listens for player messages over the mesh. All player and game data is
 stored in a local SQLite file (`meshcore_messages.db`) in the project
 directory.

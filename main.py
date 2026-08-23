@@ -144,6 +144,24 @@ __all__ = [
 PUBLIC_CHANNEL_IDX = 0  # which channel index the bot listens to for public commands
 
 
+# --- Companion connection ------------------------------------------------
+# The game talks to a companion identity hosted by the openHop Repeater
+# daemon on this same Pi, over its MeshCore frame protocol on TCP --
+# rather than to a USB-attached companion radio. openHop serves one
+# client per companion port, so this port is the game's alone (the
+# weather and news bots hold their own identities on their own ports).
+COMPANION_HOST = "127.0.0.1"
+COMPANION_PORT = 5052
+
+
+# Unlike a USB link, the transport here is a local service that gets
+# restarted for config changes and upgrades -- routine, not exceptional.
+# meshcore_py re-sends CMD_APP_START after each reconnect, which is what
+# the frame server needs to re-establish the session; subscriptions and
+# auto message fetching survive since the MeshCore object itself does.
+COMPANION_RECONNECT_ATTEMPTS = 10
+
+
 # --- Channel advertisement ----------------------------------------------
 # Every ADVERT_INTERVAL_SECONDS the bot broadcasts an invitation on the
 # public channel. The schedule keys off the messages log (the last time
@@ -537,8 +555,11 @@ async def on_message(mc, event):
 async def main():
     init_db()
 
-    mc = await MeshCore.create_serial("/dev/ttyACM0", 115200)
-    print("Connected OK")
+    mc = await MeshCore.create_tcp(
+        COMPANION_HOST, COMPANION_PORT,
+        auto_reconnect=True, max_reconnect_attempts=COMPANION_RECONNECT_ATTEMPTS,
+    )
+    print(f"Connected OK ({COMPANION_HOST}:{COMPANION_PORT})")
 
     result = await mc.commands.get_contacts()
     if result.type == EventType.ERROR:
